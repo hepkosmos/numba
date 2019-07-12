@@ -1,7 +1,9 @@
 from __future__ import print_function, absolute_import
 
 import sys
+import platform
 
+import llvmlite.binding as ll
 import llvmlite.llvmpy.core as lc
 
 from numba import _dynfunc, config
@@ -9,10 +11,14 @@ from numba.callwrapper import PyCallWrapper
 from .base import BaseContext, PYOBJECT
 from numba import utils, cgutils, types
 from numba.utils import cached_property
-from numba.targets import callconv, codegen, externals, intrinsics, listobj, setobj
+from numba.targets import (
+    callconv, codegen, externals, intrinsics, listobj, setobj, dictimpl,
+)
 from .options import TargetOptions
 from numba.runtime import rtsys
+from numba.compiler_lock import global_compiler_lock
 from . import fastmathpass
+
 
 # Keep those structures in sync with _dynfunc.c.
 
@@ -37,9 +43,14 @@ class CPUContext(BaseContext):
     def create_module(self, name):
         return self._internal_codegen._create_empty_module(name)
 
+    @global_compiler_lock
     def init(self):
         self.is32bit = (utils.MACHINE_BITS == 32)
         self._internal_codegen = codegen.JITCPUCodegen("numba.exec")
+
+        # Add ARM ABI functions from libgcc_s
+        if platform.machine() == 'armv7l':
+            ll.load_library_permanently('libgcc_s.so.1')
 
         # Map external C functions.
         externals.c_math_functions.install(self)
@@ -47,15 +58,18 @@ class CPUContext(BaseContext):
         # Initialize NRT runtime
         rtsys.initialize(self)
 
+        # Initialize additional implementations
+        if utils.PY3:
+            import numba.unicode
+
     def load_additional_registries(self):
         # Add target specific implementations
-        from . import (cffiimpl, cmathimpl, mathimpl, npyimpl, operatorimpl,
+        from . import (cffiimpl, cmathimpl, mathimpl, npyimpl,
                        printimpl, randomimpl)
         self.install_registry(cmathimpl.registry)
         self.install_registry(cffiimpl.registry)
         self.install_registry(mathimpl.registry)
         self.install_registry(npyimpl.registry)
-        self.install_registry(operatorimpl.registry)
         self.install_registry(printimpl.registry)
         self.install_registry(randomimpl.registry)
         self.install_registry(randomimpl.registry)
@@ -115,9 +129,15 @@ class CPUContext(BaseContext):
         """
         return setobj.build_set(self, builder, set_type, items)
 
+    def build_map(self, builder, dict_type, item_types, items):
+        from numba import dictobject
+
+        return dictobject.build_map(self, builder, dict_type, item_types, items)
+
+
     def post_lowering(self, mod, library):
-        if self.enable_fastmath:
-            fastmathpass.rewrite_module(mod)
+        if self.fastmath:
+            fastmathpass.rewrite_module(mod, self.fastmath)
 
         if self.is32bit:
             # 32-bit machine needs to replace all 64-bit div/rem to avoid
@@ -173,6 +193,42 @@ class CPUContext(BaseContext):
         aryty = types.Array(types.int32, ndim, 'A')
         return self.get_abi_sizeof(self.get_value_type(aryty))
 
+
+class FastMathOptions(object):
+    """
+    Options for controlling fast math optimization.
+    """
+    def __init__(self, value):
+        # https://releases.llvm.org/7.0.0/docs/LangRef.html#fast-math-flags
+        valid_flags = {
+            'fast',
+            'nnan', 'ninf', 'nsz', 'arcp',
+            'contract', 'afn', 'reassoc',
+        }
+
+        if value is True:
+            self.flags = {'fast'}
+        elif value is False:
+            self.flags = set()
+        elif isinstance(value, set):
+            invalid = value - valid_flags
+            if invalid:
+                raise ValueError("Unrecognized fastmath flags: %s" % invalid)
+            self.flags = value
+        elif isinstance(value, dict):
+            invalid = set(value.keys()) - valid_flags
+            if invalid:
+                raise ValueError("Unrecognized fastmath flags: %s" % invalid)
+            self.flags = {v for v, enable in value.items() if enable}
+        else:
+            raise ValueError("Expected fastmath option(s) to be either a bool, dict or set")
+
+    def __bool__(self):
+        return bool(self.flags)
+
+    __nonzero__ = __bool__
+
+
 class ParallelOptions(object):
     """
     Options for controlling auto parallelization.
@@ -216,7 +272,7 @@ class CPUTargetOptions(TargetOptions):
         "_nrt": bool,
         "no_rewrites": bool,
         "no_cpython_wrapper": bool,
-        "fastmath": bool,
+        "fastmath": FastMathOptions,
         "error_model": str,
         "parallel": ParallelOptions,
     }

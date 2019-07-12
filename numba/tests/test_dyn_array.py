@@ -873,6 +873,13 @@ class TestNdEye(BaseTest):
             return np.eye(n)
         self.check_outputs(func, [(1,), (3,)])
 
+    def test_eye_n_dtype(self):
+        # check None option, dtype class, instance of dtype class
+        for dt in (None, np.complex128, np.complex64(1)):
+            def func(n, dtype=dt):
+                return np.eye(n, dtype=dtype)
+            self.check_outputs(func, [(1,), (3,)])
+
     def test_eye_n_m(self):
         def func(n, m):
             return np.eye(n, m)
@@ -1062,7 +1069,7 @@ class TestNpArray(MemoryLeakMixin, BaseTest):
         # A list
         got = cfunc([2, 3, 42])
         self.assertPreciseEqual(got, np.intp([2, 3, 42]))
-        # A heterogenous tuple
+        # A heterogeneous tuple
         got = cfunc((1.0, 2.5j, 42))
         self.assertPreciseEqual(got, np.array([1.0, 2.5j, 42]))
         # An empty tuple
@@ -1124,15 +1131,17 @@ class TestNpArray(MemoryLeakMixin, BaseTest):
             self.assertIn(msg, str(raises.exception))
 
         with check_raises(('array(float64, 1d, C) not allowed in a '
-                           'homogenous sequence')):
+                           'homogeneous sequence')):
             cfunc(np.array([1.]))
 
         with check_raises(('type (int64, reflected list(int64)) does '
                           'not have a regular shape')):
             cfunc((np.int64(1), [np.int64(2)]))
 
-        with check_raises(("cannot convert (int64, Record([('a', '<i4'), "
-                           "('b', '<f4')])) to a homogenous type")):
+        with check_raises(
+                "cannot convert (int64, Record(a[type=int32;offset=0],"
+                "b[type=float32;offset=4];8;False)) to a homogeneous type",
+            ):
             st = np.dtype([('a', 'i4'), ('b', 'f4')])
             val = np.zeros(1, dtype=st)[0]
             cfunc(((1, 2), (np.int64(1), val)))

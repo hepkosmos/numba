@@ -88,6 +88,8 @@ if not _unsupported:
 
 class TestStencilBase(unittest.TestCase):
 
+    _numba_parallel_test_ = False
+
     def __init__(self, *args):
         # flags for njit()
         self.cflags = Flags()
@@ -429,6 +431,87 @@ class TestStencil(TestStencilBase):
 
     @skip_unsupported
     @tag('important')
+    def test_stencil_call_const(self):
+        """Tests numba.stencil call that has an index that can be inferred as
+        constant from a unary expr. Otherwise, this would raise an error since
+        neighborhood length is not specified.
+        """
+        def test_impl1(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 1
+            numba.stencil(lambda a,c : 0.3 * (a[-c] + a[0] + a[c]))(
+                                                                   A, c, out=B)
+            return B
+
+        def test_impl2(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 2
+            numba.stencil(lambda a,c : 0.3 * (a[1-c] + a[0] + a[c-1]))(
+                                                                   A, c, out=B)
+            return B
+
+        # recursive expr case
+        def test_impl3(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 2
+            numba.stencil(lambda a,c : 0.3 * (a[-c+1] + a[0] + a[c-1]))(
+                                                                   A, c, out=B)
+            return B
+
+        # multi-constant case
+        def test_impl4(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            d = 1
+            c = 2
+            numba.stencil(lambda a,c,d : 0.3 * (a[-c+d] + a[0] + a[c-d]))(
+                                                                A, c, d, out=B)
+            return B
+
+        def test_impl_seq(n):
+            A = np.arange(n)
+            B = np.zeros(n)
+            c = 1
+            for i in range(1, n - 1):
+                B[i] = 0.3 * (A[i - c] + A[i] + A[i + c])
+            return B
+
+        n = 100
+        # constant inference is only possible in parallel path
+        cpfunc1 = self.compile_parallel(test_impl1, (types.intp,))
+        cpfunc2 = self.compile_parallel(test_impl2, (types.intp,))
+        cpfunc3 = self.compile_parallel(test_impl3, (types.intp,))
+        cpfunc4 = self.compile_parallel(test_impl4, (types.intp,))
+        expected = test_impl_seq(n)
+        # parfor result
+        parfor_output1 = cpfunc1.entry_point(n)
+        parfor_output2 = cpfunc2.entry_point(n)
+        parfor_output3 = cpfunc3.entry_point(n)
+        parfor_output4 = cpfunc4.entry_point(n)
+        np.testing.assert_almost_equal(parfor_output1, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output2, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output3, expected, decimal=3)
+        np.testing.assert_almost_equal(parfor_output4, expected, decimal=3)
+
+        # check error in regular Python path
+        with self.assertRaises(ValueError) as e:
+            test_impl4(4)
+
+        self.assertIn("stencil kernel index is not constant, "
+                      "'neighborhood' option required", str(e.exception))
+        # check error in njit path
+        # TODO: ValueError should be thrown instead of LoweringError
+        with self.assertRaises(LoweringError) as e:
+            njit(test_impl4)(4)
+
+        self.assertIn("stencil kernel index is not constant, "
+                      "'neighborhood' option required", str(e.exception))
+
+    @skip_unsupported
+    @tag('important')
     def test_stencil_parallel_off(self):
         """Tests 1D numba.stencil calls without parallel translation
            turned off.
@@ -439,6 +522,61 @@ class TestStencil(TestStencilBase):
         cpfunc = self.compile_parallel(test_impl, (numba.float64[:],), stencil=False)
         self.assertNotIn('@do_scheduling', cpfunc.library.get_llvm_str())
 
+    @skip_unsupported
+    def test_out_kwarg_w_cval(self):
+        """ Issue #3518, out kwarg did not work with cval."""
+        # test const value that matches the arg dtype, and one that can be cast
+        const_vals = [7, 7.0]
+
+        def kernel(a):
+            return (a[0, 0] - a[1, 0])
+
+        for const_val in const_vals:
+            stencil_fn = numba.stencil(kernel, cval=const_val)
+
+            def wrapped():
+                A = np.arange(12).reshape((3, 4))
+                ret = np.ones_like(A)
+                stencil_fn(A, out=ret)
+                return ret
+
+            # stencil function case
+            A = np.arange(12).reshape((3, 4))
+            expected = np.full_like(A, -4)
+            expected[-1, :] = const_val
+            ret = np.ones_like(A)
+            stencil_fn(A, out=ret)
+            np.testing.assert_almost_equal(ret, expected)
+
+            # wrapped function case, check njit, then njit(parallel=True)
+            impls = self.compile_all(wrapped,)
+            for impl in impls:
+                got = impl.entry_point()
+                np.testing.assert_almost_equal(got, expected)
+
+        # now check exceptions for cval dtype mismatch with out kwarg dtype
+        stencil_fn = numba.stencil(kernel, cval=1j)
+
+        def wrapped():
+            A = np.arange(12).reshape((3, 4))
+            ret = np.ones_like(A)
+            stencil_fn(A, out=ret)
+            return ret
+
+        A = np.arange(12).reshape((3, 4))
+        ret = np.ones_like(A)
+        with self.assertRaises(ValueError) as e:
+            stencil_fn(A, out=ret)
+        msg = "cval type does not match stencil return type."
+        self.assertIn(msg, str(e.exception))
+
+        for compiler in [self.compile_njit, self.compile_parallel]:
+            try:
+                compiler(wrapped,())
+            except(ValueError, LoweringError) as e:
+                self.assertIn(msg, str(e))
+            else:
+                raise AssertionError("Expected error was not raised")
 
 
 class pyStencilGenerator:
@@ -576,6 +714,9 @@ class pyStencilGenerator:
             """
             Generates an ast.Num of value `value`
             """
+            # pretend bools are ints, ast has no boolean literal support
+            if isinstance(value, bool):
+                return ast.Num(int(value))
             if abs(value) >= 0:
                 return ast.Num(value)
             else:
@@ -672,59 +813,216 @@ class pyStencilGenerator:
             indexing.
             """
 
-            node = self.generic_visit(node)
-            if (node.value.id in self._argnames) and (
-                    node.value.id not in self._standard_indexing):
-                # 2D index
-                if isinstance(node.slice.value, ast.Tuple):
-                    idx = []
-                    for x, val in enumerate(node.slice.value.elts):
-                        useval = self._const_assigns.get(val, val)
-                        idx.append(
-                            ast.BinOp(
-                                left=ast.Name(
-                                    id=self._id_pat %
-                                    self.ids[x],
-                                    ctx=ast.Load()),
+            def handle2dindex(node):
+                idx = []
+                for x, val in enumerate(node.slice.value.elts):
+                    useval = self._const_assigns.get(val, val)
+                    idx.append(
+                        ast.BinOp(
+                            left=ast.Name(
+                                id=self._id_pat % self.ids[x],
+                                ctx=ast.Load()),
+                            op=ast.Add(),
+                            right=useval,
+                            ctx=ast.Load()))
+                if self._idx_len == -1:
+                    self._idx_len = len(idx)
+                else:
+                    if(self._idx_len != len(idx)):
+                        raise ValueError(
+                            "Relative indexing mismatch detected")
+                if isinstance(node.ctx, ast.Store):
+                    msg = ("Assignments to array passed to "
+                            "stencil kernels is not allowed")
+                    raise ValueError(msg)
+                context = ast.Load()
+                newnode = ast.Subscript(
+                    value=node.value,
+                    slice=ast.Index(
+                        value=ast.Tuple(
+                            elts=idx,
+                            ctx=ast.Load()),
+                        ctx=ast.Load()),
+                    ctx=context)
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+
+                # now work out max/min for index ranges i.e. stencil size
+                if self._mins is None and self._maxes is None:
+                    # first pass
+                    self._mins = [self._imax] * self._idx_len
+                    self._maxes = [self._imin] * self._idx_len
+
+                if not self._neighborhood:
+                    for x, lnode in enumerate(node.slice.value.elts):
+                        if isinstance(lnode, ast.Num) or\
+                                isinstance(lnode, ast.UnaryOp):
+                            relvalue = self.get_val_from_num(lnode)
+                        elif (hasattr(lnode, 'id') and
+                                lnode.id in self._const_assigns):
+                            relvalue = self._const_assigns[lnode.id]
+                        else:
+                            raise ValueError(
+                                "Cannot interpret indexing value")
+                        if relvalue < self._mins[x]:
+                            self._mins[x] = relvalue
+                        if relvalue > self._maxes[x]:
+                            self._maxes[x] = relvalue
+                else:
+                    for x, lnode in enumerate(self._neighborhood):
+                        self._mins[x] = self._neighborhood[x][0]
+                        self._maxes[x] = self._neighborhood[x][1]
+
+                return newnode
+
+            def handle1dindex(node):
+                useval = self._const_assigns.get(
+                    node.slice.value, node.slice.value)
+                idx = ast.BinOp(left=ast.Name(
+                                id=self._id_pat % self.ids[0],
+                                ctx=ast.Load()),
                                 op=ast.Add(),
                                 right=useval,
-                                ctx=ast.Load()))
-                    if self._idx_len == -1:
-                        self._idx_len = len(idx)
+                                ctx=ast.Load())
+                if self._idx_len == -1:
+                    self._idx_len = 1
+                else:
+                    if(self._idx_len != 1):
+                        raise ValueError(
+                            "Relative indexing mismatch detected")
+                if isinstance(node.ctx, ast.Store):
+                    msg = ("Assignments to array passed to "
+                            "stencil kernels is not allowed")
+                    raise ValueError(msg)
+                context = ast.Load()
+                newnode = ast.Subscript(
+                    value=node.value,
+                    slice=ast.Index(
+                        value=idx,
+                        ctx=ast.Load()),
+                    ctx=context)
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+
+                # now work out max/min for index ranges i.e. stencil size
+                if self._mins is None and self._maxes is None:
+                    # first pass
+                    self._mins = [self._imax, ]
+                    self._maxes = [self._imin, ]
+
+                if not self._neighborhood:
+                    if isinstance(node.slice.value, ast.Num) or\
+                            isinstance(node.slice.value, ast.UnaryOp):
+                        relvalue = self.get_val_from_num(node.slice.value)
+                    elif (hasattr(node.slice.value, 'id') and
+                            node.slice.value.id in self._const_assigns):
+                        relvalue = self._const_assigns[node.slice.value.id]
                     else:
-                        if(self._idx_len != len(idx)):
-                            raise ValueError(
-                                "Relative indexing mismatch detected")
-                    if isinstance(node.ctx, ast.Store):
-                        msg = ("Assignments to array passed to "
-                               "stencil kernels is not allowed")
-                        raise ValueError(msg)
-                    context = ast.Load()
-                    newnode = ast.Subscript(
-                        value=node.value,
-                        slice=ast.Index(
-                            value=ast.Tuple(
-                                elts=idx,
+                        raise ValueError("Cannot interpret indexing value")
+                    if relvalue < self._mins[0]:
+                        self._mins[0] = relvalue
+                    if relvalue > self._maxes[0]:
+                        self._maxes[0] = relvalue
+                else:
+                    self._mins[0] = self._neighborhood[0][0]
+                    self._maxes[0] = self._neighborhood[0][1]
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+                return newnode
+
+            def computeSlice(i, node):
+                def gen_idx(val, x):
+                    useval = self._const_assigns.get(val, val)
+                    value = self.get_val_from_num(val)
+                    tmp = ast.BinOp(
+                            left=ast.Name(
+                                id=self._id_pat % self.ids[x],
                                 ctx=ast.Load()),
-                            ctx=ast.Load()),
-                        ctx=context)
-                    ast.copy_location(newnode, node)
-                    ast.fix_missing_locations(newnode)
+                            op=ast.Add(),
+                            right=useval,
+                            ctx=ast.Load())
+                    ast.copy_location(tmp, node)
+                    ast.fix_missing_locations(tmp)
+                    return tmp
+                newnode = ast.Slice(gen_idx(node.lower, i),
+                                 gen_idx(node.upper, i),
+                                 node.step)
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+                return newnode
 
-                    # now work out max/min for index ranges i.e. stencil size
-                    if self._mins is None and self._maxes is None:
-                        # first pass
-                        self._mins = [self._imax] * self._idx_len
-                        self._maxes = [self._imin] * self._idx_len
+            def computeIndex(i, node):
+                useval = self._const_assigns.get(node.value, node.value)
+                idx = ast.BinOp(left=ast.Name(
+                                id=self._id_pat % self.ids[i],
+                                ctx=ast.Load()),
+                                op=ast.Add(),
+                                right=useval,
+                                ctx=ast.Load())
+                newnode = ast.Index(value=idx, ctx=ast.Load())
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+                return newnode
 
-                    if not self._neighborhood:
-                        for x, lnode in enumerate(node.slice.value.elts):
-                            if isinstance(lnode, ast.Num) or\
-                                    isinstance(lnode, ast.UnaryOp):
-                                relvalue = self.get_val_from_num(lnode)
-                            elif (hasattr(lnode, 'id') and
-                                  lnode.id in self._const_assigns):
-                                relvalue = self._const_assigns[lnode.id]
+            def handleExtSlice(node):
+                idx = []
+                for i, val in enumerate(node.slice.dims):
+                    if isinstance(val, ast.Slice):
+                        idx.append(computeSlice(i, val))
+                    if isinstance(val, ast.Index):
+                        idx.append(computeIndex(i, val))
+                    # TODO: handle more node types
+                if self._idx_len == -1:
+                    self._idx_len = len(node.slice.dims)
+                else:
+                    if(self._idx_len != len(node.slice.dims)):
+                        raise ValueError(
+                            "Relative indexing mismatch detected")
+
+                if isinstance(node.ctx, ast.Store):
+                    msg = ("Assignments to array passed to "
+                            "stencil kernels is not allowed")
+                    raise ValueError(msg)
+                context = ast.Load()
+                newnode = ast.Subscript(
+                    value=node.value,
+                    slice=ast.ExtSlice(
+                        dims=idx,
+                        ctx=ast.Load()),
+                        ctx=context
+                        )
+
+                # now work out max/min for index ranges i.e. stencil size
+                if self._mins is None and self._maxes is None:
+                    # first pass
+                    self._mins = [self._imax] * self._idx_len
+                    self._maxes = [self._imin] * self._idx_len
+
+                if not self._neighborhood:
+                    for x, anode in enumerate(node.slice.dims):
+                        if isinstance(anode, ast.Slice):
+                            for lnode in [anode.lower, anode.upper]:
+                                if isinstance(lnode, ast.Num) or\
+                                        isinstance(lnode, ast.UnaryOp):
+                                    relvalue = self.get_val_from_num(lnode)
+                                elif (hasattr(lnode, 'id') and
+                                        lnode.id in self._const_assigns):
+                                    relvalue = self._const_assigns[lnode.id]
+                                else:
+                                    raise ValueError(
+                                        "Cannot interpret indexing value")
+                                if relvalue < self._mins[x]:
+                                    self._mins[x] = relvalue
+                                if relvalue > self._maxes[x]:
+                                    self._maxes[x] = relvalue
+                        else:
+                            val = anode.value
+                            if isinstance(val, ast.Num) or\
+                                    isinstance(val, ast.UnaryOp):
+                                relvalue = self.get_val_from_num(val)
+                            elif (hasattr(val, 'id') and
+                                    val.id in self._const_assigns):
+                                relvalue = self._const_assigns[val.id]
                             else:
                                 raise ValueError(
                                     "Cannot interpret indexing value")
@@ -732,67 +1030,79 @@ class pyStencilGenerator:
                                 self._mins[x] = relvalue
                             if relvalue > self._maxes[x]:
                                 self._maxes[x] = relvalue
-                    else:
-                        for x, lnode in enumerate(self._neighborhood):
-                            self._mins[x] = self._neighborhood[x][0]
-                            self._maxes[x] = self._neighborhood[x][1]
+                else:
+                    for x, lnode in enumerate(self._neighborhood):
+                        self._mins[x] = self._neighborhood[x][0]
+                        self._maxes[x] = self._neighborhood[x][1]
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+                return newnode
 
-                    return newnode
+
+            def handleSlice(node):
+                idx = computeSlice(0, node.slice)
+                idx.ctx=ast.Load()
+                if isinstance(node.ctx, ast.Store):
+                    msg = ("Assignments to array passed to "
+                            "stencil kernels is not allowed")
+                    raise ValueError(msg)
+                context = ast.Load()
+                newnode = ast.Subscript(
+                    value=node.value,
+                    slice=idx,
+                    ctx=context)
+                ast.copy_location(newnode, node)
+                ast.fix_missing_locations(newnode)
+
+                if self._idx_len == -1:
+                    self._idx_len = 1
+                else:
+                    if(self._idx_len != 1):
+                        raise ValueError(
+                            "Relative indexing mismatch detected")
+
+                # now work out max/min for index ranges i.e. stencil size
+                if self._mins is None and self._maxes is None:
+                    # first pass
+                    self._mins = [self._imax]
+                    self._maxes = [self._imin]
+
+                if not self._neighborhood:
+                    if isinstance(node.slice.value, ast.Num) or\
+                            isinstance(node.slice.value, ast.UnaryOp):
+                        relvalue = self.get_val_from_num(node.slice.value)
+                    elif (hasattr(node.slice.value, 'id') and
+                            node.slice.value.id in self._const_assigns):
+                        relvalue = self._const_assigns[node.slice.value.id]
+                    else:
+                        raise ValueError("Cannot interpret indexing value")
+                    if relvalue < self._mins[0]:
+                        self._mins[0] = relvalue
+                    if relvalue > self._maxes[0]:
+                        self._maxes[0] = relvalue
+                else:
+                    self._mins[0] = self._neighborhood[0][0]
+                    self._maxes[0] = self._neighborhood[0][1]
+
+                return newnode
+
+
+            node = self.generic_visit(node)
+            if (node.value.id in self._argnames) and (
+                    node.value.id not in self._standard_indexing):
+
+                # fancy slice
+                if isinstance(node.slice, ast.ExtSlice):
+                    return handleExtSlice(node)
+                # plain slice
+                if isinstance(node.slice, ast.Slice):
+                    return handleSlice(node)
+                # 2D index
+                if isinstance(node.slice.value, ast.Tuple):
+                    return handle2dindex(node)
                 # 1D index
                 elif isinstance(node.slice, ast.Index):
-                    useval = self._const_assigns.get(
-                        node.slice.value, node.slice.value)
-                    idx = ast.BinOp(left=ast.Name(
-                                    id=self._id_pat %
-                                    self.ids[0],
-                                    ctx=ast.Load()),
-                                    op=ast.Add(),
-                                    right=useval,
-                                    ctx=ast.Load())
-                    if self._idx_len == -1:
-                        self._idx_len = 1
-                    else:
-                        if(self._idx_len != 1):
-                            raise ValueError(
-                                "Relative indexing mismatch detected")
-                    if isinstance(node.ctx, ast.Store):
-                        msg = ("Assignments to array passed to "
-                               "stencil kernels is not allowed")
-                        raise ValueError(msg)
-                    context = ast.Load()
-                    newnode = ast.Subscript(
-                        value=node.value,
-                        slice=ast.Index(
-                            value=idx,
-                            ctx=ast.Load()),
-                        ctx=context)
-                    ast.copy_location(newnode, node)
-                    ast.fix_missing_locations(newnode)
-
-                    # now work out max/min for index ranges i.e. stencil size
-                    if self._mins is None and self._maxes is None:
-                        # first pass
-                        self._mins = [self._imax, ]
-                        self._maxes = [self._imin, ]
-
-                    if not self._neighborhood:
-                        if isinstance(node.slice.value, ast.Num) or\
-                                isinstance(node.slice.value, ast.UnaryOp):
-                            relvalue = self.get_val_from_num(node.slice.value)
-                        elif (hasattr(node.slice.value, 'id') and
-                              node.slice.value.id in self._const_assigns):
-                            relvalue = self._const_assigns[node.slice.value.id]
-                        else:
-                            raise ValueError("Cannot interpret indexing value")
-                        if relvalue < self._mins[0]:
-                            self._mins[0] = relvalue
-                        if relvalue > self._maxes[0]:
-                            self._maxes[0] = relvalue
-                    else:
-                        self._mins[0] = self._neighborhood[0][0]
-                        self._maxes[0] = self._neighborhood[0][1]
-
-                    return newnode
+                    return handle1dindex(node)
                 else:  # unknown
                     raise ValueError("Unhandled subscript")
             else:
@@ -1249,6 +1559,7 @@ class TestManyStencils(TestStencilBase):
         stencil_args.update(options)
 
         expected_present = True
+
         try:
             # ast impl
             ast_impl = pyStencil(func_or_mode=pyfunc, **options)
@@ -2396,6 +2707,66 @@ class TestManyStencils(TestStencilBase):
                 'neighborhood': (
                     (-3, 0), (-3, 0)), 'standard_indexing': 'b', 'cval': 1.5})
 
+    def test_basic91(self):
+        """ Issue #3454, const(int) == const(int) evaluating incorrectly. """
+        def kernel(a):
+            b = 0
+            if(2 == 0):
+                b = 2
+            return a[0, 0] + b
+
+        a = np.arange(10. * 20.).reshape(10, 20)
+        self.check(kernel, a)
+
+    def test_basic92(self):
+        """ Issue #3497, bool return type evaluating incorrectly. """
+        def kernel(a):
+            return (a[-1, -1] ^ a[-1, 0] ^ a[-1, 1] ^
+                    a[0, -1]  ^ a[0, 0]  ^ a[0, 1]  ^
+                    a[1, -1]  ^ a[1, 0]  ^ a[1, 1])
+
+        A = np.array(np.arange(20) % 2).reshape(4, 5).astype(np.bool_)
+        self.check(kernel, A)
+
+    def test_basic93(self):
+        """ Issue #3497, bool return type evaluating incorrectly. """
+        def kernel(a):
+            return (a[-1, -1] ^ a[-1, 0] ^ a[-1, 1] ^
+                    a[0, -1]  ^ a[0, 0]  ^ a[0, 1]  ^
+                    a[1, -1]  ^ a[1, 0]  ^ a[1, 1])
+
+        A = np.array(np.arange(20) % 2).reshape(4, 5).astype(np.bool_)
+        self.check(kernel, A, options={'cval': True})
+
+    def test_basic94(self):
+        """ Issue #3528. Support for slices. """
+        def kernel(a):
+            return np.median(a[-1:2, -1:2])
+        a = np.arange(20, dtype=np.uint32).reshape(4, 5)
+        self.check(kernel, a, options={'neighborhood': ((-1, 1), (-1, 1),)})
+
+    @unittest.skip("not yet supported")
+    def test_basic95(self):
+        """ Slice, calculate neighborhood. """
+        def kernel(a):
+            return np.median(a[-1:2, -3:4])
+        a = np.arange(20, dtype=np.uint32).reshape(4, 5)
+        self.check(kernel, a)
+
+    def test_basic96(self):
+        """ 1D slice. """
+        def kernel(a):
+            return np.median(a[-1:2])
+        a = np.arange(20, dtype=np.uint32)
+        self.check(kernel, a, options={'neighborhood': ((-1, 1),)})
+
+    @unittest.skip("not yet supported")
+    def test_basic97(self):
+        """ 2D slice and index. """
+        def kernel(a):
+            return np.median(a[-1:2, 3])
+        a = np.arange(20, dtype=np.uint32).reshape(4, 5)
+        self.check(kernel, a)
 
 if __name__ == "__main__":
     unittest.main()

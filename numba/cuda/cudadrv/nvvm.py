@@ -299,7 +299,7 @@ def _find_arch(mycc):
             if i == 0:
                 # CC lower than supported
                 raise NvvmSupportError("GPU compute capability %d.%d is "
-                                       "not supported (requires >=2.0)" % mycc)
+                                       "not supported (requires >=%d.%d)" % (mycc + cc))
             else:
                 # return the previous CC
                 return SUPPORTED_CC[i - 1]
@@ -318,17 +318,11 @@ def get_arch_option(major, minor):
     return 'compute_%d%d' % arch
 
 
-MISSING_LIBDEVICE_MSG = '''
-Please define environment variable NUMBAPRO_LIBDEVICE=/path/to/libdevice
-/path/to/libdevice -- is the path to the directory containing the libdevice.*.bc
-files in the installation of CUDA.  (requires CUDA >=8.0)
-'''
-
 MISSING_LIBDEVICE_FILE_MSG = '''Missing libdevice file for {arch}.
-Please ensure you have package cudatoolkit 8.0.
+Please ensure you have package cudatoolkit >= 8.
 Install package by:
 
-    conda install cudatoolkit=8.0
+    conda install cudatoolkit
 '''
 
 
@@ -546,6 +540,8 @@ re_annotations = re.compile(r"\bnonnull\b")
 
 re_unsupported_keywords = re.compile(r"\b(local_unnamed_addr|writeonly)\b")
 
+re_parenthesized_list = re.compile(r"\((.*)\)")
+
 
 def llvm39_to_34_ir(ir):
     """
@@ -633,12 +629,47 @@ def llvm39_to_34_ir(ir):
             # no !range metadata on calls
             line = re_range.sub('', line).rstrip(',')
 
+            if '@llvm.memset' in line:
+                line = re_parenthesized_list.sub(
+                    _replace_llvm_memset_usage,
+                    line,
+                    )
+        if 'declare' in line:
+            if '@llvm.memset' in line:
+                line = re_parenthesized_list.sub(
+                    _replace_llvm_memset_declaration,
+                    line,
+                    )
+
         # Remove unknown annotations
         line = re_annotations.sub('', line)
 
         buf.append(line)
 
     return '\n'.join(buf)
+
+
+def _replace_llvm_memset_usage(m):
+    """Replace `llvm.memset` usage for llvm7+.
+
+    Used as functor for `re.sub.
+    """
+    params = list(m.group(1).split(','))
+    align = re.search(r'align (\d+)', params[0]).group(1)
+    params.insert(-1, 'i32 {}'.format(align))
+    out = ', '.join(params)
+    return '({})'.format(out)
+
+
+def _replace_llvm_memset_declaration(m):
+    """Replace `llvm.memset` declaration for llvm7+.
+
+    Used as functor for `re.sub.
+    """
+    params = list(m.group(1).split(','))
+    params.insert(-1, 'i32')
+    out = ', '.join(params)
+    return '({})'.format(out)
 
 
 def set_cuda_kernel(lfunc):

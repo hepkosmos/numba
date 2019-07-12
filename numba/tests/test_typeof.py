@@ -237,9 +237,9 @@ class TestTypeof(ValueTypingTestBase, TestCase):
         self.assertEqual(tp_404, typeof(RequestError.internal_error))
 
         with self.assertRaises(ValueError) as raises:
-            typeof(HeterogenousEnum.red)
+            typeof(HeterogeneousEnum.red)
         self.assertEqual(str(raises.exception),
-                         "Cannot type heterogenous enum: got value types complex128, float64")
+                         "Cannot type heterogeneous enum: got value types complex128, float64")
 
     @tag('important')
     def test_enum_class(self):
@@ -256,9 +256,9 @@ class TestTypeof(ValueTypingTestBase, TestCase):
         self.assertNotEqual(tp_error, tp_shape)
 
         with self.assertRaises(ValueError) as raises:
-            typeof(HeterogenousEnum)
+            typeof(HeterogeneousEnum)
         self.assertEqual(str(raises.exception),
-                         "Cannot type heterogenous enum: got value types complex128, float64")
+                         "Cannot type heterogeneous enum: got value types complex128, float64")
 
     @tag('important')
     def test_dtype(self):
@@ -268,6 +268,13 @@ class TestTypeof(ValueTypingTestBase, TestCase):
         dtype = np.dtype([('m', np.int32), ('n', 'S5')])
         rec_ty = numpy_support.from_struct_dtype(dtype)
         self.assertEqual(typeof(dtype), types.DType(rec_ty))
+
+    @tag('important')
+    def test_dtype_values(self):
+        self.assertEqual(typeof(np.int64), types.NumberClass(types.int64))
+        self.assertEqual(typeof(np.float64), types.NumberClass(types.float64))
+        self.assertEqual(typeof(np.int32), types.NumberClass(types.int32))
+        self.assertEqual(typeof(np.int8), types.NumberClass(types.int8))
 
     @tag('important')
     def test_ctypes(self):

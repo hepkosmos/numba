@@ -10,26 +10,30 @@ Programming
 Can I pass a function as an argument to a jitted function?
 ----------------------------------------------------------
 
-You can't, but in many cases you can use a closure to emulate it.
-For example, this example::
+As of Numba 0.39, you can, so long as the function argument has also been
+JIT-compiled::
 
    @jit(nopython=True)
    def f(g, x):
        return g(x) + g(-x)
 
-   result = f(my_g_function, 1)
+   result = f(jitted_g_function, 1)
 
-could be rewritten using a factory function::
+However, dispatching with arguments that are functions has extra overhead.
+If this matters for your application, you can also use a factory function to 
+capture the function argument in a closure::
 
    def make_f(g):
-       # Note: a new f() is compiled each time make_f() is called!
+       # Note: a new f() is created each time make_f() is called!
        @jit(nopython=True)
        def f(x):
            return g(x) + g(-x)
        return f
 
-   f = make_f(my_g_function)
+   f = make_f(jitted_g_function)
    result = f(1)
+
+Improving the dispatch performance of functions in Numba is an ongoing task.
 
 Numba doesn't seem to care when I modify a global variable
 ----------------------------------------------------------
@@ -79,13 +83,9 @@ propagate to all computations involving those variables.
 How can I tell if ``parallel=True`` worked?
 -------------------------------------------
 
-Set the :ref:`environment variable <numba-envvars>` ``NUMBA_WARNINGS`` to
-non-zero and if the ``parallel=True`` transformations failed for a function
-decorated as such, a warning will be displayed.
-
-Also, setting the :ref:`environment variable <numba-envvars>`
-``NUMBA_DEBUG_ARRAY_OPT_STATS`` will show some statistics about which
-operators/calls are converted to parallel for-loops.
+If the ``parallel=True`` transformations failed for a function
+decorated as such, a warning will be displayed. See also
+:ref:`numba-parallel-diagnostics` for information about parallel diagnostics.
 
 Performance
 ===========
@@ -157,8 +157,8 @@ Does Numba automatically parallelize code?
 It can, in some cases:
 
 * Ufuncs and gufuncs with the ``target="parallel"`` option will run on multiple threads.
-* The experimental ``parallel=True`` option to ``@jit`` will attempt to optimize
-  array operations and run them in parallel.  It also adds support for ``prange()`` to
+* The ``parallel=True`` option to ``@jit`` will attempt to optimize array
+  operations and run them in parallel.  It also adds support for ``prange()`` to
   explicitly parallelize a loop.
 
 You can also manually run computations on multiple threads yourself and use
@@ -191,6 +191,30 @@ Try to pass ``cache=True`` to the ``@jit`` decorator.  It will keep the
 compiled version on disk for later use.
 
 A more radical alternative is :ref:`ahead-of-time compilation <pycc>`.
+
+
+GPU Programming
+===============
+
+How do I work around the ``CUDA intialized before forking`` error?
+------------------------------------------------------------------
+
+On Linux, the ``multiprocessing`` module in the Python standard library
+defaults to using the ``fork`` method for creating new processes.  Because of
+the way process forking duplicates state between the parent and child
+processes, CUDA will not work correctly in the child process if the CUDA
+runtime was initialized *prior* to the fork.  Numba detects this and raises a
+``CudaDriverError`` with the message ``CUDA initialized before forking``.
+
+One approach to avoid this error is to make all calls to ``numba.cuda``
+functions inside the child processes or after the process pool is created.
+However, this is not always possible, as you might want to query the number of
+available GPUs before starting the process pool.  In Python 3, you can change
+the process start method, as described in the `multiprocessing documentation
+<https://docs.python.org/3.6/library/multiprocessing.html#contexts-and-start-methods>`_.
+Switching from ``fork`` to ``spawn`` or ``forkserver`` will avoid the CUDA
+initalization issue, although the child processes will not inherit any global
+variables from their parent.
 
 
 Integration with other utilities
@@ -244,8 +268,18 @@ value, for example::
 Miscellaneous
 =============
 
+Where does the project name "Numba" come from?
+----------------------------------------------
+
+"Numba" is a combination of "NumPy" and "Mamba". Mambas are some of the fastest
+snakes in the world, and Numba makes your Python code fast.
+
 How do I reference/cite/acknowledge Numba in other work?
 --------------------------------------------------------
-For academic use, the best option is to cite our ACM Proceedings:
-`Numba: a LLVM-based Python JIT compiler.
-<http://dl.acm.org/citation.cfm?id=2833162&dl=ACM&coll=DL>`_
+For academic use, the best option is to cite our ACM Proceedings: `Numba: a
+LLVM-based Python JIT compiler.
+<http://dl.acm.org/citation.cfm?id=2833162&dl=ACM&coll=DL>`_ You can also find
+`the sources on github <https://github.com/numba/Numba-SC15-Paper>`_, including
+`a pre-print pdf
+<https://github.com/numba/Numba-SC15-Paper/raw/master/numba_sc15.pdf>`_, in case
+you don't have access to the ACM site but would like to read the paper.

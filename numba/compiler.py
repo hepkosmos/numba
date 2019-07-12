@@ -3,25 +3,25 @@ from __future__ import print_function, division, absolute_import
 from contextlib import contextmanager
 from collections import namedtuple, defaultdict
 import sys
+import copy
 import warnings
 import traceback
-import threading
 from .tracing import event
 
 from numba import (bytecode, interpreter, funcdesc, postproc,
-                   typing, typeinfer, lowering, objmode, utils, config,
+                   typing, typeinfer, lowering, pylowering, utils, config,
                    errors, types, ir, rewrites, transforms)
 from numba.targets import cpu, callconv
 from numba.annotations import type_annotations
-from numba.parfor import PreParforPass, ParforPass, Parfor
+from numba.parfor import PreParforPass, ParforPass, Parfor, ParforDiagnostics
 from numba.inline_closurecall import InlineClosureCallPass
 from numba.errors import CompilerError
+from numba.ir_utils import raise_on_unsupported_feature, warn_deprecated
+from numba.compiler_lock import global_compiler_lock
+from numba.analysis import dead_branch_prune
 
 # terminal color markup
 _termcolor = errors.termcolor()
-
-# Lock for the preventing multiple compiler execution
-lock_compiler = threading.RLock()
 
 
 class Flags(utils.ConfigOptions):
@@ -51,7 +51,7 @@ class Flags(utils.ConfigOptions):
         'nrt': False,
         'no_rewrites': False,
         'error_model': 'python',
-        'fastmath': False,
+        'fastmath': cpu.FastMathOptions(False),
         'noalias': False,
     }
 
@@ -73,7 +73,11 @@ CR_FIELDS = ["typing_context",
              "library",
              "call_helper",
              "environment",
-             "has_dynamic_globals"]
+             "metadata",
+             # List of functions to call to initialize on unserialization
+             # (i.e cache load).
+             "reload_init",
+            ]
 
 
 class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
@@ -91,11 +95,18 @@ class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
         fndesc.typemap = fndesc.calltypes = None
 
         return (libdata, self.fndesc, self.environment, self.signature,
-                self.objectmode, self.interpmode, self.lifted, typeann)
+                self.objectmode, self.interpmode, self.lifted, typeann,
+                self.reload_init)
 
     @classmethod
     def _rebuild(cls, target_context, libdata, fndesc, env,
-                 signature, objectmode, interpmode, lifted, typeann):
+                 signature, objectmode, interpmode, lifted, typeann,
+                 reload_init):
+        if reload_init:
+            # Re-run all
+            for fn in reload_init:
+                fn()
+
         library = target_context.codegen().unserialize_library(libdata)
         cfunc = target_context.get_executable(library, fndesc, env)
         cr = cls(target_context=target_context,
@@ -111,7 +122,8 @@ class CompileResult(namedtuple("_CompileResult", CR_FIELDS)):
                  lifted=lifted,
                  typing_error=None,
                  call_helper=None,
-                 has_dynamic_globals=False,  # by definition
+                 metadata=None, # Do not store, arbitrary and potentially large!
+                 reload_init=reload_init,
                  )
         return cr
 
@@ -121,7 +133,6 @@ _LowerResult = namedtuple("_LowerResult", [
     "call_helper",
     "cfunc",
     "env",
-    "has_dynamic_globals",
 ])
 
 
@@ -155,7 +166,7 @@ def compile_isolated(func, args, return_type=None, flags=DEFAULT_FLAGS,
     # Register the contexts in case for nested @jit or @overload calls
     with cpu_target.nested_context(typingctx, targetctx):
         return compile_extra(typingctx, targetctx, func, args, return_type,
-                             flags, locals)
+                            flags, locals)
 
 
 def run_frontend(func):
@@ -234,19 +245,21 @@ class _PipelineManager(object):
         exc.args = (newmsg,)
         return exc
 
+    @global_compiler_lock
     def run(self, status):
         assert self._finalized, "PM must be finalized before run()"
         for pipeline_name in self.pipeline_order:
-            event(pipeline_name)
+            event("Pipeline: %s" % pipeline_name)
             is_final_pipeline = pipeline_name == self.pipeline_order[-1]
             for stage, stage_name in self.pipeline_stages[pipeline_name]:
                 try:
-                    event(stage_name)
+                    event("-- %s" % stage_name)
                     stage()
                 except _EarlyPipelineCompletion as e:
                     return e.result
                 except BaseException as e:
-                    msg = "Failed at %s (%s)" % (pipeline_name, stage_name)
+                    msg = "Failed in %s mode pipeline (step: %s)" % \
+                        (pipeline_name, stage_name)
                     patched_exception = self._patch_error(msg, e)
                     # No more fallback pipelines?
                     if is_final_pipeline:
@@ -285,12 +298,17 @@ class BasePipeline(object):
         self.bc = None
         self.func_id = None
         self.func_ir = None
-        self.func_ir_original = None  # used for fallback
         self.lifted = None
         self.lifted_from = None
         self.typemap = None
         self.calltypes = None
         self.type_annotation = None
+        self.metadata = {} # holds arbitrary inter-pipeline stage meta data
+        self.reload_init = []
+
+        # parfor diagnostics info, add to metadata
+        self.parfor_diagnostics = ParforDiagnostics()
+        self.metadata['parfor_diagnostics'] = self.parfor_diagnostics
 
         self.status = _CompileStatus(
             can_fallback=self.flags.enable_pyobject,
@@ -311,11 +329,16 @@ class BasePipeline(object):
                 if utils.PYVERSION >= (3,):
                     # Clear all references attached to the traceback
                     e = e.with_traceback(None)
-                warnings.warn_explicit('%s: %s' % (msg, e),
+                # this emits a warning containing the error message body in the
+                # case of fallback from npm to objmode
+                loop_lift = '' if self.flags.enable_looplift else 'OUT'
+                msg_rewrite = ("\nCompilation is falling back to object mode "
+                               "WITH%s looplifting enabled because %s"
+                               % (loop_lift, msg))
+                warnings.warn_explicit('%s due to: %s' % (msg_rewrite, e),
                                        errors.NumbaWarning,
                                        self.func_id.filename,
                                        self.func_id.firstlineno)
-
                 raise
 
     @contextmanager
@@ -396,9 +419,6 @@ class BasePipeline(object):
     def stage_process_ir(self):
         ir_processing_stage(self.func_ir)
 
-    def stage_preserve_ir(self):
-        self.func_ir_original = self.func_ir.copy()
-
     def frontend_looplift(self):
         """
         Loop lifting analysis and transformation
@@ -425,14 +445,33 @@ class BasePipeline(object):
             cres = compile_ir(self.typingctx, self.targetctx, main,
                               self.args, self.return_type,
                               outer_flags, self.locals,
-                              lifted=tuple(loops), lifted_from=None)
+                              lifted=tuple(loops), lifted_from=None,
+                              is_lifted_loop=True)
             return cres
+
+    def stage_frontend_withlift(self):
+        """
+        Extract with-contexts
+        """
+        main, withs = transforms.with_lifting(
+            func_ir=self.func_ir,
+            typingctx=self.typingctx,
+            targetctx=self.targetctx,
+            flags=self.flags,
+            locals=self.locals,
+            )
+        if withs:
+            cres = compile_ir(self.typingctx, self.targetctx, main,
+                              self.args, self.return_type,
+                              self.flags, self.locals,
+                              lifted=tuple(withs), lifted_from=None,
+                              pipeline_class=type(self))
+            raise _EarlyPipelineCompletion(cres)
 
     def stage_objectmode_frontend(self):
         """
         Front-end: Analyze bytecode, generate Numba IR, infer types
         """
-        self.func_ir = self.func_ir_original or self.func_ir
         if self.flags.enable_looplift:
             assert not self.lifted
             cres = self.frontend_looplift()
@@ -443,6 +482,23 @@ class BasePipeline(object):
         self.typemap = defaultdict(lambda: types.pyobject)
         self.calltypes = defaultdict(lambda: types.pyobject)
         self.return_type = types.pyobject
+
+    def stage_dead_branch_prune(self):
+        """
+        This prunes dead branches, a dead branch is one which is derivable as
+        not taken at compile time purely based on const/literal evaluation.
+        """
+        assert self.func_ir
+        msg = ('Internal error in pre-inference dead branch pruning '
+               'pass encountered during compilation of '
+               'function "%s"' % (self.func_id.func_name,))
+        with self.fallback_context(msg):
+            dead_branch_prune(self.func_ir, self.args)
+
+        if config.DEBUG or config.DUMP_IR:
+            print('branch_pruned_ir'.center(80, '-'))
+            print(self.func_ir.dump())
+            print('end branch_pruned_ir'.center(80, '-'))
 
     def stage_nopython_frontend(self):
         """
@@ -505,8 +561,10 @@ class BasePipeline(object):
             self.func_ir,
             self.type_annotation.typemap,
             self.type_annotation.calltypes, self.typingctx,
-            self.flags.auto_parallel
+            self.flags.auto_parallel,
+            self.parfor_diagnostics.replaced_fns
             )
+
         preparfor_pass.run()
 
     def stage_parfor_pass(self):
@@ -517,32 +575,33 @@ class BasePipeline(object):
         assert self.func_ir
         parfor_pass = ParforPass(self.func_ir, self.type_annotation.typemap,
             self.type_annotation.calltypes, self.return_type, self.typingctx,
-            self.flags.auto_parallel, self.flags)
+            self.flags.auto_parallel, self.flags, self.parfor_diagnostics)
         parfor_pass.run()
 
-        if config.WARNINGS:
-            # check the parfor pass worked and warn if it didn't
-            has_parfor = False
-            for blk in self.func_ir.blocks.values():
-                for stmnt in blk.body:
-                    if isinstance(stmnt, Parfor):
-                        has_parfor = True
-                        break
-                else:
-                    continue
-                break
+        # check the parfor pass worked and warn if it didn't
+        has_parfor = False
+        for blk in self.func_ir.blocks.values():
+            for stmnt in blk.body:
+                if isinstance(stmnt, Parfor):
+                    has_parfor = True
+                    break
+            else:
+                continue
+            break
 
-            if not has_parfor:
-                # parfor calls the compiler chain again with a string
-                if not self.func_ir.loc.filename == '<string>':
-                    msg = ("parallel=True was specified but no transformation"
-                           " for parallel execution was possible.")
-                    warnings.warn_explicit(
-                        msg,
-                        errors.NumbaWarning,
-                        self.func_id.filename,
-                        self.func_id.firstlineno
-                        )
+        if not has_parfor:
+            # parfor calls the compiler chain again with a string
+            if not self.func_ir.loc.filename == '<string>':
+                url = ("http://numba.pydata.org/numba-doc/latest/user/"
+                       "parallel.html#diagnostics")
+                msg = ("\nThe keyword argument 'parallel=True' was specified "
+                       "but no transformation for parallel execution was "
+                       "possible.\n\nTo find out why, try turning on parallel "
+                       "diagnostics, see %s for help." % url)
+                warnings.warn(errors.NumbaPerformanceWarning(msg,
+                                                             self.func_ir.loc))
+        # Add reload function to initialize the parallel backend.
+        self.reload_init.append(_reload_parfors)
 
     def stage_inline_pass(self):
         """
@@ -550,8 +609,15 @@ class BasePipeline(object):
         """
         # Ensure we have an IR and type information.
         assert self.func_ir
+
+        # if the return type is a pyobject, there's no type info available and
+        # no ability to resolve certain typed function calls in the array
+        # inlining code, use this variable to indicate
+        typed_pass = not isinstance(self.return_type, types.misc.PyObject)
         inline_pass = InlineClosureCallPass(self.func_ir,
-                                            self.flags.auto_parallel)
+                                            self.flags.auto_parallel,
+                                            self.parfor_diagnostics.replaced_fns,
+                                            typed_pass)
         inline_pass.run()
         # Remove all Dels, and re-run postproc
         post_proc = postproc.PostProcessor(self.func_ir)
@@ -584,6 +650,14 @@ class BasePipeline(object):
             with open(config.HTML, 'w') as fout:
                 self.type_annotation.html_annotate(fout)
 
+    def stage_dump_diagnostics(self):
+        if self.flags.auto_parallel.enabled:
+            if config.PARALLEL_DIAGNOSTICS:
+                if self.parfor_diagnostics is not None:
+                    self.parfor_diagnostics.dump(config.PARALLEL_DIAGNOSTICS)
+                else:
+                    raise RuntimeError("Diagnostics failed.")
+
     def backend_object_mode(self):
         """
         Object mode compilation
@@ -612,7 +686,8 @@ class BasePipeline(object):
                 self.typemap,
                 self.return_type,
                 self.calltypes,
-                self.flags)
+                self.flags,
+                self.metadata)
 
     def _backend(self, lowerfn, objectmode):
         """
@@ -641,7 +716,8 @@ class BasePipeline(object):
             lifted=self.lifted,
             fndesc=lowered.fndesc,
             environment=lowered.env,
-            has_dynamic_globals=lowered.has_dynamic_globals,
+            metadata=self.metadata,
+            reload_init=self.reload_init,
             )
 
     def stage_objectmode_backend(self):
@@ -651,8 +727,10 @@ class BasePipeline(object):
         lowerfn = self.backend_object_mode
         self._backend(lowerfn, objectmode=True)
 
-        # Warn if compiled function in object mode and force_pyobject not set
+        # Warn, deprecated behaviour, code compiled in objmode without
+        # force_pyobject indicates fallback from nopython mode
         if not self.flags.force_pyobject:
+            # first warn about object mode and yes/no to lifted loops
             if len(self.lifted) > 0:
                 warn_msg = ('Function "%s" was compiled in object mode without'
                             ' forceobj=True, but has lifted loops.' %
@@ -660,9 +738,17 @@ class BasePipeline(object):
             else:
                 warn_msg = ('Function "%s" was compiled in object mode without'
                             ' forceobj=True.' % (self.func_id.func_name,))
-            warnings.warn_explicit(warn_msg, errors.NumbaWarning,
-                                   self.func_id.filename,
-                                   self.func_id.firstlineno)
+            warnings.warn(errors.NumbaWarning(warn_msg,
+                                              self.func_ir.loc))
+
+            url = ("http://numba.pydata.org/numba-doc/latest/reference/"
+                   "deprecation.html#deprecation-of-object-mode-fall-"
+                   "back-behaviour-when-using-jit")
+            msg = ("\nFall-back from the nopython compilation path to the "
+                   "object mode compilation path has been detected, this is "
+                   "deprecated behaviour.\n\nFor more information visit %s" %
+                   url)
+            warnings.warn(errors.NumbaDeprecationWarning(msg, self.func_ir.loc))
             if self.flags.release_gil:
                 warn_msg = ("Code running in object mode won't allow parallel"
                             " execution despite nogil=True.")
@@ -694,6 +780,10 @@ class BasePipeline(object):
                                  lifted=(),
                                  fndesc=None,)
 
+    def stage_ir_legalization(self):
+        raise_on_unsupported_feature(self.func_ir, self.typemap)
+        warn_deprecated(self.func_ir, self.typemap)
+
     def stage_cleanup(self):
         """
         Cleanup intermediate results to release resources.
@@ -717,10 +807,8 @@ class BasePipeline(object):
         The current stages contain type-agnostic rewrite passes.
         """
         if not self.flags.no_rewrites:
-            if self.status.can_fallback:
-                pm.add_stage(self.stage_preserve_ir,
-                             "preserve IR for fallback")
             pm.add_stage(self.stage_generic_rewrites, "nopython rewrites")
+            pm.add_stage(self.stage_dead_branch_prune, "dead branch pruning")
         pm.add_stage(self.stage_inline_pass,
                      "inline calls to locally defined closures")
 
@@ -751,15 +839,22 @@ class BasePipeline(object):
         """
         pm.add_stage(self.stage_cleanup, "cleanup intermediate results")
 
+    def add_with_handling_stage(self, pm):
+        pm.add_stage(self.stage_frontend_withlift, "Handle with contexts")
+
     def define_nopython_pipeline(self, pm, name='nopython'):
         """Add the nopython-mode pipeline to the pipeline manager
         """
         pm.create_pipeline(name)
         self.add_preprocessing_stage(pm)
+        self.add_with_handling_stage(pm)
         self.add_pre_typing_stage(pm)
         self.add_typing_stage(pm)
         self.add_optimization_stage(pm)
+        pm.add_stage(self.stage_ir_legalization,
+                     "ensure IR is legal prior to lowering")
         self.add_lowering_stage(pm)
+        pm.add_stage(self.stage_dump_diagnostics, "dump diagnostics")
         self.add_cleanup_stage(pm)
 
     def define_objectmode_pipeline(self, pm, name='object'):
@@ -769,7 +864,11 @@ class BasePipeline(object):
         self.add_preprocessing_stage(pm)
         pm.add_stage(self.stage_objectmode_frontend,
                      "object mode frontend")
+        pm.add_stage(self.stage_inline_pass,
+                     "inline calls to locally defined closures")
         pm.add_stage(self.stage_annotate_type, "annotate type")
+        pm.add_stage(self.stage_ir_legalization,
+                     "ensure IR is legal prior to lowering")
         pm.add_stage(self.stage_objectmode_backend, "object mode backend")
         self.add_cleanup_stage(pm)
 
@@ -837,7 +936,7 @@ def _make_subtarget(targetctx, flags):
     if flags.auto_parallel:
         subtargetoptions['auto_parallel'] = flags.auto_parallel
     if flags.fastmath:
-        subtargetoptions['enable_fastmath'] = True
+        subtargetoptions['fastmath'] = flags.fastmath
     error_model = callconv.create_error_model(flags.error_model, targetctx)
     subtargetoptions['error_model'] = error_model
 
@@ -874,17 +973,67 @@ def compile_extra(typingctx, targetctx, func, args, return_type, flags,
 
 
 def compile_ir(typingctx, targetctx, func_ir, args, return_type, flags,
-               locals, lifted=(), lifted_from=None, library=None):
+               locals, lifted=(), lifted_from=None, is_lifted_loop=False,
+               library=None, pipeline_class=Pipeline):
     """
     Compile a function with the given IR.
 
     For internal use only.
     """
 
-    pipeline = Pipeline(typingctx, targetctx, library,
-                        args, return_type, flags, locals)
-    return pipeline.compile_ir(func_ir=func_ir, lifted=lifted,
-                               lifted_from=lifted_from)
+    # This is a special branch that should only run on IR from a lifted loop
+    if is_lifted_loop:
+        # This code is pessimistic and costly, but it is a not often trodden
+        # path and it will go away once IR is made immutable. The problem is
+        # that the rewrite passes can mutate the IR into a state that makes
+        # it possible for invalid tokens to be transmitted to lowering which
+        # then trickle through into LLVM IR and causes RuntimeErrors as LLVM
+        # cannot compile it. As a result the following approach is taken:
+        # 1. Create some new flags that copy the original ones but switch
+        #    off rewrites.
+        # 2. Compile with 1. to get a compile result
+        # 3. Try and compile another compile result but this time with the
+        #    original flags (and IR being rewritten).
+        # 4. If 3 was successful, use the result, else use 2.
+
+        # create flags with no rewrites
+        norw_flags = copy.deepcopy(flags)
+        norw_flags.no_rewrites = True
+
+        def compile_local(the_ir, the_flags):
+            pipeline = pipeline_class(typingctx, targetctx, library,
+                                      args, return_type, the_flags, locals)
+            return pipeline.compile_ir(func_ir=the_ir, lifted=lifted,
+                                       lifted_from=lifted_from)
+
+        # compile with rewrites off, IR shouldn't be mutated irreparably
+        norw_cres = compile_local(func_ir.copy(), norw_flags)
+
+        # try and compile with rewrites on if no_rewrites was not set in the
+        # original flags, IR might get broken but we've got a CompileResult
+        # that's usable from above.
+        rw_cres = None
+        if not flags.no_rewrites:
+            # Suppress warnings in compilation retry
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", errors.NumbaWarning)
+                try:
+                    rw_cres = compile_local(func_ir.copy(), flags)
+                except Exception:
+                    pass
+        # if the rewrite variant of compilation worked, use it, else use
+        # the norewrites backup
+        if rw_cres is not None:
+            cres = rw_cres
+        else:
+            cres = norw_cres
+        return cres
+
+    else:
+        pipeline = pipeline_class(typingctx, targetctx, library,
+                                  args, return_type, flags, locals)
+        return pipeline.compile_ir(func_ir=func_ir, lifted=lifted,
+                                lifted_from=lifted_from)
 
 
 def compile_internal(typingctx, targetctx, library,
@@ -982,52 +1131,57 @@ def type_inference_stage(typingctx, interp, args, return_type, locals={}):
 
 
 def native_lowering_stage(targetctx, library, interp, typemap, restype,
-                          calltypes, flags):
+                          calltypes, flags, metadata):
     # Lowering
     fndesc = funcdesc.PythonFunctionDescriptor.from_specialized_function(
         interp, typemap, restype, calltypes, mangler=targetctx.mangler,
         inline=flags.forceinline, noalias=flags.noalias)
 
-    lower = lowering.Lower(targetctx, library, fndesc, interp)
-    lower.lower()
-    if not flags.no_cpython_wrapper:
-        lower.create_cpython_wrapper(flags.release_gil)
-    env = lower.env
-    call_helper = lower.call_helper
-    has_dynamic_globals = lower.has_dynamic_globals
-    del lower
+    with targetctx.push_code_library(library):
+        lower = lowering.Lower(targetctx, library, fndesc, interp,
+                               metadata=metadata)
+        lower.lower()
+        if not flags.no_cpython_wrapper:
+            lower.create_cpython_wrapper(flags.release_gil)
+        env = lower.env
+        call_helper = lower.call_helper
+        del lower
 
     if flags.no_compile:
-        return _LowerResult(fndesc, call_helper, cfunc=None, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=None, env=env)
     else:
         # Prepare for execution
         cfunc = targetctx.get_executable(library, fndesc, env)
         # Insert native function for use by other jitted-functions.
         # We also register its library to allow for inlining.
         targetctx.insert_user_function(cfunc, fndesc, [library])
-        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env)
 
 
 def py_lowering_stage(targetctx, library, interp, flags):
     fndesc = funcdesc.PythonFunctionDescriptor.from_object_mode_function(
         interp
         )
-    lower = objmode.PyLower(targetctx, library, fndesc, interp)
-    lower.lower()
-    if not flags.no_cpython_wrapper:
-        lower.create_cpython_wrapper()
-    env = lower.env
-    call_helper = lower.call_helper
-    has_dynamic_globals = lower.has_dynamic_globals
-    del lower
+    with targetctx.push_code_library(library):
+        lower = pylowering.PyLower(targetctx, library, fndesc, interp)
+        lower.lower()
+        if not flags.no_cpython_wrapper:
+            lower.create_cpython_wrapper()
+        env = lower.env
+        call_helper = lower.call_helper
+        del lower
 
     if flags.no_compile:
-        return _LowerResult(fndesc, call_helper, cfunc=None, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=None, env=env)
     else:
         # Prepare for execution
         cfunc = targetctx.get_executable(library, fndesc, env)
-        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env,
-                            has_dynamic_globals=has_dynamic_globals)
+        return _LowerResult(fndesc, call_helper, cfunc=cfunc, env=env)
+
+
+def _reload_parfors():
+    """Reloader for cached parfors
+    """
+    # Re-initialize the parallel backend when load from cache.
+    from numba.npyufunc.parallel import _launch_threads
+    _launch_threads()

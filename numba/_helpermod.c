@@ -116,6 +116,45 @@ build_c_helpers_dict(void)
     declmethod(rnd_init);
     declmethod(poisson_ptrs);
 
+    /* Unicode string support */
+    declmethod(extract_unicode);
+    declmethod(gettyperecord);
+    declmethod(get_PyUnicode_ExtendedCase);
+
+    /* for gdb breakpoint */
+    declmethod(gdb_breakpoint);
+
+    /* for dictionary support */
+    declmethod(test_dict);
+    declmethod(dict_new_minsize);
+    declmethod(dict_set_method_table);
+    declmethod(dict_free);
+    declmethod(dict_length);
+    declmethod(dict_lookup);
+    declmethod(dict_insert);
+    declmethod(dict_insert_ez);
+    declmethod(dict_delitem);
+    declmethod(dict_popitem);
+    declmethod(dict_iter_sizeof);
+    declmethod(dict_iter);
+    declmethod(dict_iter_next);
+    declmethod(dict_dump);
+
+    /* for list support */
+    declmethod(test_list);
+    declmethod(list_new);
+    declmethod(list_set_method_table);
+    declmethod(list_free);
+    declmethod(list_length);
+    declmethod(list_setitem);
+    declmethod(list_getitem);
+    declmethod(list_append);
+    declmethod(list_pop);
+    declmethod(list_delete_slice);
+    declmethod(list_iter_sizeof);
+    declmethod(list_iter);
+    declmethod(list_iter_next);
+
 #define MATH_UNARY(F, R, A) declmethod(F);
 #define MATH_BINARY(F, R, A, B) declmethod(F);
     #include "mathnames.h"
@@ -159,6 +198,18 @@ build_npymath_exports_dict(void)
     }
     return dct;
 }
+
+
+/*
+ * Helper to deal with flushing stdout
+ */
+PyAPI_FUNC(void) _numba_flush_stdout(void) ;
+
+void
+_numba_flush_stdout(void) {
+  fflush(stdout);
+}
+
 
 static PyMethodDef ext_methods[] = {
     { "rnd_get_state", (PyCFunction) _numba_rnd_get_state, METH_O, NULL },
@@ -236,7 +287,12 @@ MOD_INIT(_helperlib) {
     PyModule_AddIntConstant(m, "long_max", LONG_MAX);
     PyModule_AddIntConstant(m, "py_buffer_size", sizeof(Py_buffer));
     PyModule_AddIntConstant(m, "py_gil_state_size", sizeof(PyGILState_STATE));
-
+#if (PY_MAJOR_VERSION >= 3) && (PY_MINOR_VERSION >= 3)
+    PyModule_AddIntConstant(m, "py_unicode_1byte_kind", PyUnicode_1BYTE_KIND);
+    PyModule_AddIntConstant(m, "py_unicode_2byte_kind", PyUnicode_2BYTE_KIND);
+    PyModule_AddIntConstant(m, "py_unicode_4byte_kind", PyUnicode_4BYTE_KIND);
+    PyModule_AddIntConstant(m, "py_unicode_wchar_kind", PyUnicode_WCHAR_KIND);
+#endif
     numba_rnd_ensure_global_init();
 
     return MOD_SUCCESS_VAL(m);

@@ -1,12 +1,12 @@
 from __future__ import print_function, division, absolute_import
 
 import numpy as np
-
+import operator
 from collections import namedtuple
 
 from numba import types, utils
-from numba.typing.templates import (AttributeTemplate, AbstractTemplate,
-                                    infer, infer_getattr, signature,
+from numba.typing.templates import (AttributeTemplate, AbstractTemplate, infer,
+                                    infer_global, infer_getattr, signature,
                                     bound_function)
 # import time side effect: array operations requires typing support of sequence
 # defined in collections: e.g. array.shape[i]
@@ -144,7 +144,11 @@ def get_array_index_type(ary, idx):
             elif not check_contiguity(right_indices[::-1]):
                 layout = 'A'
 
-        res = ary.copy(ndim=ndim, layout=layout)
+        if ndim == 0:
+            # Implicitly convert to a scalar if the output ndim==0
+            res = ary.dtype
+        else:
+            res = ary.copy(ndim=ndim, layout=layout)
 
     # Re-wrap indices
     if isinstance(idx, types.BaseTuple):
@@ -155,10 +159,8 @@ def get_array_index_type(ary, idx):
     return Indexing(idx, res, advanced)
 
 
-@infer
+@infer_global(operator.getitem)
 class GetItemBuffer(AbstractTemplate):
-    key = "getitem"
-
     def generic(self, args, kws):
         assert not kws
         [ary, idx] = args
@@ -166,10 +168,8 @@ class GetItemBuffer(AbstractTemplate):
         if out is not None:
             return signature(out.result, ary, out.index)
 
-@infer
+@infer_global(operator.setitem)
 class SetItemBuffer(AbstractTemplate):
-    key = "setitem"
-
     def generic(self, args, kws):
         assert not kws
         ary, idx, val = args
@@ -398,7 +398,7 @@ class ArrayAttribute(AttributeTemplate):
             # vararg case
             if any(not sentry_shape_scalar(a) for a in args):
                 raise TypeError("reshape({0}) is not supported".format(
-                    ', '.join(args)))
+                    ', '.join(map(str, args))))
 
             retty = ary.copy(ndim=len(args))
             return signature(retty, *args)
@@ -414,7 +414,7 @@ class ArrayAttribute(AttributeTemplate):
     def resolve_argsort(self, ary, args, kws):
         assert not args
         kwargs = dict(kws)
-        kind = kwargs.pop('kind', types.Const('quicksort'))
+        kind = kwargs.pop('kind', types.StringLiteral('quicksort'))
         if kwargs:
             msg = "Unsupported keywords: {!r}"
             raise TypingError(msg.format([k for k in kwargs.keys()]))
@@ -449,7 +449,9 @@ class ArrayAttribute(AttributeTemplate):
                             "cannot convert from %s to %s"
                             % (dtype, ary, ary.dtype, dtype))
         layout = ary.layout if ary.layout in 'CF' else 'C'
-        retty = ary.copy(dtype=dtype, layout=layout)
+        # reset the write bit irrespective of whether the cast type is the same
+        # as the current dtype, this replicates numpy
+        retty = ary.copy(dtype=dtype, layout=layout, readonly=False)
         return signature(retty, *args)
 
     @bound_function("array.ravel")
@@ -504,7 +506,7 @@ class DTypeAttr(AttributeTemplate):
             val = 'i'
         else:
             return None  # other types not supported yet
-        return types.Const(val)
+        return types.StringLiteral(val)
 
 @infer
 class StaticGetItemArray(AbstractTemplate):
@@ -516,7 +518,8 @@ class StaticGetItemArray(AbstractTemplate):
         if (isinstance(ary, types.Array) and isinstance(idx, str) and
             isinstance(ary.dtype, types.Record)):
             if idx in ary.dtype.fields:
-                return ary.copy(dtype=ary.dtype.typeof(idx), layout='A')
+                ret = ary.copy(dtype=ary.dtype.typeof(idx), layout='A')
+                return signature(ret, *args)
 
 
 @infer_getattr
@@ -538,7 +541,7 @@ class StaticGetItemRecord(AbstractTemplate):
         if isinstance(record, types.Record) and isinstance(idx, str):
             ret = record.typeof(idx)
             assert ret
-            return ret
+            return signature(ret, *args)
 
 @infer
 class StaticSetItemRecord(AbstractTemplate):
@@ -550,7 +553,7 @@ class StaticSetItemRecord(AbstractTemplate):
         if isinstance(record, types.Record) and isinstance(idx, str):
             expectedty = record.typeof(idx)
             if self.context.can_convert(value, expectedty) is not None:
-                return signature(types.void, record, types.Const(idx), value)
+                return signature(types.void, record, types.literal(idx), value)
 
 
 @infer_getattr
@@ -624,10 +627,15 @@ def sum_expand(self, args, kws):
         out = signature(_expand_integer(self.this.dtype), *args,
                         recvr=self.this)
     else:
-        # There is an axis paramter so the return type of this summation is
-        # an array of dimension one less than the input array.
-        return_type = types.Array(dtype=_expand_integer(self.this.dtype),
-                                  ndim=self.this.ndim-1, layout='C')
+        # There is an axis parameter
+        if self.this.ndim == 1:
+            # 1d reduces to a scalar
+            return_type = self.this.dtype
+        else:
+            # the return type of this summation is  an array of dimension one
+            # less than the input array.
+            return_type = types.Array(dtype=_expand_integer(self.this.dtype),
+                                    ndim=self.this.ndim-1, layout='C')
         out = signature(return_type, *args, recvr=self.this)
     return out.replace(pysig=pysig)
 
@@ -646,16 +654,23 @@ def generic_hetero_real(self, args, kws):
         return signature(types.float64, recvr=self.this)
     return signature(self.this.dtype, recvr=self.this)
 
+def generic_hetero_always_real(self, args, kws):
+    assert not args
+    assert not kws
+    if isinstance(self.this.dtype, (types.Integer, types.Boolean)):
+        return signature(types.float64, recvr=self.this)
+    if isinstance(self.this.dtype, types.Complex):
+        return signature(self.this.dtype.underlying_float, recvr=self.this)
+    return signature(self.this.dtype, recvr=self.this)
+
 def generic_index(self, args, kws):
     assert not args
     assert not kws
     return signature(types.intp, recvr=self.this)
 
-def install_array_method(name, generic, support_literals=False):
+def install_array_method(name, generic):
     my_attr = {"key": "array." + name, "generic": generic}
     temp_class = type("Array_" + name, (AbstractTemplate,), my_attr)
-    if support_literals:
-        temp_class.support_literals = support_literals
     def array_attribute_attachment(self, ary):
         return types.BoundFunction(temp_class, ary)
 
@@ -667,24 +682,30 @@ for fname in ["min", "max"]:
 
 # Functions that return a machine-width type, to avoid overflows
 install_array_method("prod", generic_expand)
-install_array_method("sum", sum_expand, support_literals=True)
+install_array_method("sum", sum_expand)
 
 # Functions that return a machine-width type, to avoid overflows
 for fname in ["cumsum", "cumprod"]:
     install_array_method(fname, generic_expand_cumulative)
 
 # Functions that require integer arrays get promoted to float64 return
-for fName in ["mean", "var", "std"]:
+for fName in ["mean"]:
     install_array_method(fName, generic_hetero_real)
+
+# var and std by definition return in real space and int arrays
+# get promoted to float64 return
+for fName in ["var", "std"]:
+    install_array_method(fName, generic_hetero_always_real)
+
 
 # Functions that return an index (intp)
 install_array_method("argmin", generic_index)
 install_array_method("argmax", generic_index)
 
 
-@infer
+@infer_global(operator.eq)
 class CmpOpEqArray(AbstractTemplate):
-    key = '=='
+    #key = operator.eq
 
     def generic(self, args, kws):
         assert not kws

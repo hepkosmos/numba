@@ -1,6 +1,7 @@
 """
 Assorted utilities for use in tests.
 """
+from __future__ import print_function
 
 import cmath
 import contextlib
@@ -14,6 +15,9 @@ import subprocess
 import sys
 import tempfile
 import time
+import io
+import ctypes
+import multiprocessing as mp
 
 import numpy as np
 
@@ -36,7 +40,13 @@ nrt_flags = Flags()
 nrt_flags.set("nrt")
 
 
-tag = testing.make_tag_decorator(['important'])
+tag = testing.make_tag_decorator(['important', 'long_running'])
+
+_windows_py27 = (sys.platform.startswith('win32') and
+                 sys.version_info[:2] == (2, 7))
+_32bit = sys.maxsize <= 2 ** 32
+_reason = 'parfors not supported'
+skip_parfors_unsupported = unittest.skipIf(_32bit or _windows_py27, _reason)
 
 
 class CompilationCache(object):
@@ -391,6 +401,12 @@ class TestCase(unittest.TestCase):
         if isinstance(first, self._complex_types):
             _assertNumberEqual(first.real, second.real, delta)
             _assertNumberEqual(first.imag, second.imag, delta)
+        elif isinstance(first, (np.timedelta64, np.datetime64)):
+            # Since Np 1.16 NaT == NaT is False, so special comparison needed
+            if numpy_support.version >= (1, 16) and np.isnat(first):
+                self.assertEqual(np.isnat(first), np.isnat(second))
+            else:
+                _assertNumberEqual(first, second, delta)
         else:
             _assertNumberEqual(first, second, delta)
 
@@ -668,3 +684,89 @@ def forbid_codegen():
         for (obj, attrname), value in old.items():
             setattr(obj, attrname, value)
 
+
+# For details about redirection of file-descriptor, read
+# https://eli.thegreenplace.net/2015/redirecting-all-kinds-of-stdout-in-python/
+
+@contextlib.contextmanager
+def redirect_fd(fd):
+    """
+    Temporarily redirect *fd* to a pipe's write end and return a file object
+    wrapping the pipe's read end.
+    """
+
+    from numba import _helperlib
+    libnumba = ctypes.CDLL(_helperlib.__file__)
+
+    libnumba._numba_flush_stdout()
+    save = os.dup(fd)
+    r, w = os.pipe()
+    try:
+        os.dup2(w, fd)
+        yield io.open(r, "r")
+    finally:
+        libnumba._numba_flush_stdout()
+        os.close(w)
+        os.dup2(save, fd)
+        os.close(save)
+
+
+def redirect_c_stdout():
+    """Redirect C stdout
+    """
+    fd = sys.__stdout__.fileno()
+    return redirect_fd(fd)
+
+
+def run_in_new_process_caching(func, cache_dir_prefix=__name__, verbose=True):
+    """Spawn a new process to run `func` with a temporary cache directory.
+
+    The childprocess's stdout and stderr will be captured and redirected to
+    the current process's stdout and stderr.
+
+    Returns
+    -------
+    ret : dict
+        exitcode: 0 for success. 1 for exception-raised.
+        stdout: str
+        stderr: str
+    """
+    ctx = mp.get_context('spawn')
+    qout = ctx.Queue()
+    cache_dir = temp_directory(cache_dir_prefix)
+    with override_env_config('NUMBA_CACHE_DIR', cache_dir):
+        proc = ctx.Process(target=_remote_runner, args=[func, qout])
+        proc.start()
+        proc.join()
+        stdout = qout.get_nowait()
+        stderr = qout.get_nowait()
+        if verbose and stdout.strip():
+            print()
+            print('STDOUT'.center(80, '-'))
+            print(stdout)
+        if verbose and stderr.strip():
+            print(file=sys.stderr)
+            print('STDERR'.center(80, '-'), file=sys.stderr)
+            print(stderr, file=sys.stderr)
+    return {
+        'exitcode': proc.exitcode,
+        'stdout': stdout,
+        'stderr': stderr,
+    }
+
+
+def _remote_runner(fn, qout):
+    """Used by `run_in_new_process_caching()`
+    """
+    with captured_stderr() as stderr:
+        with captured_stdout() as stdout:
+            try:
+                fn()
+            except Exception:
+                traceback.print_exc()
+                exitcode = 1
+            else:
+                exitcode = 0
+        qout.put(stdout.getvalue())
+    qout.put(stderr.getvalue())
+    sys.exit(exitcode)

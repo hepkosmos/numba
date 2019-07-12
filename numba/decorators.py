@@ -8,7 +8,7 @@ import sys
 import warnings
 
 from . import config, sigutils
-from .errors import DeprecationError
+from .errors import DeprecationError, NumbaDeprecationWarning
 from .targets import registry
 from .stencil import stencil
 
@@ -22,8 +22,11 @@ def autojit(*args, **kws):
 
     Use jit instead.  Calls to jit internally.
     """
-    warnings.warn("autojit is deprecated, use jit instead which now performs "
-                  "the same functionality", DeprecationWarning)
+    url = ("http://numba.pydata.org/numba-doc/latest/reference/"
+            "deprecation.html#deprecation-of-numba-autojit")
+    msg = ("autojit is deprecated, use jit instead, which provides "
+           "the same functionality. For more information visit %s" % url)
+    warnings.warn(NumbaDeprecationWarning(msg))
     return jit(*args, **kws)
 
 
@@ -130,21 +133,6 @@ def jit(signature_or_function=None, locals={}, target='cpu', cache=False,
         raise DeprecationError(_msg_deprecated_signature_arg.format('argtypes'))
     if 'restype' in options:
         raise DeprecationError(_msg_deprecated_signature_arg.format('restype'))
-
-    if options.get('parallel'):
-        uns1 = sys.platform.startswith('win32') and sys.version_info[:2] == (2, 7)
-        uns2 = sys.maxsize <= 2 ** 32
-        if uns1 or uns2:
-            msg = ("The 'parallel' target is not currently supported on "
-                   "Windows operating systems when using Python 2.7, or "
-                   "on 32 bit hardware.")
-            raise RuntimeError(msg)
-        if cache:
-            msg = ("Caching is not available when the 'parallel' target is in "
-                   "use. Caching is now being disabled to allow execution to "
-                   "continue.")
-            warnings.warn(msg, RuntimeWarning)
-            cache = False
 
     # Handle signature
     if signature_or_function is None:

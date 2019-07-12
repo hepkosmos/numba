@@ -302,6 +302,10 @@ class TestLoopLiftingAnnotate(TestCase):
 
 
 class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
+    def assert_has_lifted(self, jitted, loopcount):
+        lifted = jitted.overloads[jitted.signatures[0]].lifted
+        self.assertEqual(len(lifted), loopcount)
+
     def test_issue_734(self):
         from numba import jit, void, int32, double
 
@@ -368,7 +372,9 @@ class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
         # assert lifted function is native
         self.assertTrue(loopcres.fndesc.native)
 
-    def test_no_iteration(self):
+    def test_no_iteration_w_redef(self):
+        # redefinition of res in the loop with no use of res should not
+        # prevent lifting
         from numba import jit
 
         @jit(forceobj=True)
@@ -378,11 +384,43 @@ class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
                 res = i
             return res
 
-        # loop count = 0
+        # loop count = 1, loop lift but loop body not execute
         self.assertEqual(test.py_func(-1), test(-1))
+        self.assert_has_lifted(test, loopcount=1)
+        # loop count = 1, loop will lift and will execute
+        self.assertEqual(test.py_func(1), test(1))
+        self.assert_has_lifted(test, loopcount=1)
+
+    def test_no_iteration(self):
+        from numba import jit
+
+        @jit(forceobj=True)
+        def test(n):
+            res = 0
+            for i in range(n):
+                res += i
+            return res
+
+        # loop count = 1
+        self.assertEqual(test.py_func(-1), test(-1))
+        self.assert_has_lifted(test, loopcount=1)
+        # loop count = 1
+        self.assertEqual(test.py_func(1), test(1))
+        self.assert_has_lifted(test, loopcount=1)
+
+    def test_define_in_loop_body(self):
+        # tests a definition in a loop that leaves the loop is liftable
+        from numba import jit
+
+        @jit(forceobj=True)
+        def test(n):
+            for i in range(n):
+                res = i
+            return res
 
         # loop count = 1
         self.assertEqual(test.py_func(1), test(1))
+        self.assert_has_lifted(test, loopcount=1)
 
     def test_invalid_argument(self):
         """Test a problem caused by invalid discovery of loop argument
@@ -412,7 +450,6 @@ class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
         arg = np.arange(10)
         self.assertEqual(test.py_func(arg), test(arg))
 
-
     def test_conditionally_defined_in_loop(self):
         from numba import jit
         @jit(forceobj=True)
@@ -423,7 +460,10 @@ class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
                 if i > 0:
                    x = 6
                 y += x
+            return y, x
+
         self.assertEqual(test.py_func(), test())
+        self.assert_has_lifted(test, loopcount=1)
 
     def test_stack_offset_error_when_has_no_return(self):
         from numba import jit
@@ -492,6 +532,51 @@ class TestLoopLiftingInAction(MemoryLeakMixin, TestCase):
         # Ensure that is really a new overload for the lifted loop
         self.assertEqual(len(lifted.signatures), 2)
 
+    def test_lift_listcomp_block0(self):
+
+        def foo(X):
+            [y for y in (1,)]
+            for x in (1,):
+                pass
+            return X
+
+        # this is not nice, if you have 2+? liftable loops with one of them
+        # being list comp and in block 0 and force objmode compilation is set,
+        # in py27 this leads to a BUILD_LIST that is a lifting candidate with an
+        # entry of block 0, this is a problem as the loop lift prelude would be
+        # written to block -1 and havoc ensues. Therefore block 0 loop lifts
+        # are banned under this set of circumstances.
+
+        # check all compile and execute
+        from numba import jit
+        f = jit()(foo)
+        f(1)
+        self.assertEqual(f.overloads[f.signatures[0]].lifted, ())
+
+        f = jit(forceobj=True)(foo)
+        f(1)
+        self.assertEqual(len(f.overloads[f.signatures[0]].lifted), 1)
+
+    def test_lift_objectmode_issue_4223(self):
+        from numba import jit
+
+        @jit
+        def foo(a, b, c, d, x0, y0, n):
+            xs, ys = np.zeros(n), np.zeros(n)
+            xs[0], ys[0] = x0, y0
+            for i in np.arange(n-1):
+                xs[i+1] = np.sin(a * ys[i]) + c * np.cos(a * xs[i])
+                ys[i+1] = np.sin(b * xs[i]) + d * np.cos(b * ys[i])
+            object() # ensure object mode
+            return xs, ys
+
+        kwargs = dict(a=1.7, b=1.7, c=0.6, d=1.2, x0=0, y0=0, n=200)
+        got = foo(**kwargs)
+        expected = foo.py_func(**kwargs)
+        self.assertPreciseEqual(got[0], expected[0])
+        self .assertPreciseEqual(got[1], expected[1])
+        [lifted] = foo.overloads[foo.signatures[0]].lifted
+        self.assertEqual(len(lifted.nopython_signatures), 1)
 
 
 if __name__ == '__main__':

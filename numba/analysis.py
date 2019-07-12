@@ -7,6 +7,7 @@ from collections import namedtuple, defaultdict
 
 from numba import ir
 from numba.controlflow import CFGraph
+from numba import types, consts
 
 #
 # Analysis related to variable lifetime
@@ -17,6 +18,7 @@ _use_defs_result = namedtuple('use_defs_result', 'usemap,defmap')
 # other packages that define new nodes add calls for finding defs
 # format: {type:function}
 ir_extension_usedefs = {}
+
 
 def compute_use_defs(blocks):
     """
@@ -61,24 +63,52 @@ def compute_live_map(cfg, blocks, var_use_map, var_def_map):
     We use a simple fix-point algorithm that iterates until the set of
     live variables is unchanged for each block.
     """
+    def fix_point_progress(dct):
+        """Helper function to determine if a fix-point has been reached.
+        """
+        return tuple(len(v) for v in dct.values())
+
+    def fix_point(fn, dct):
+        """Helper function to run fix-point algorithm.
+        """
+        old_point = None
+        new_point = fix_point_progress(dct)
+        while old_point != new_point:
+            fn(dct)
+            old_point = new_point
+            new_point = fix_point_progress(dct)
+
+    def def_reach(dct):
+        """Find all variable definition reachable at the entry of a block
+        """
+        for offset in var_def_map:
+            used_or_defined = var_def_map[offset] | var_use_map[offset]
+            dct[offset] |= used_or_defined
+            # Propagate to outgoing nodes
+            for out_blk, _ in cfg.successors(offset):
+                dct[out_blk] |= dct[offset]
+
+    def liveness(dct):
+        """Find live variables.
+
+        Push var usage backward.
+        """
+        for offset in dct:
+            # Live vars here
+            live_vars = dct[offset]
+            for inc_blk, _data in cfg.predecessors(offset):
+                # Reachable at the predecessor
+                reachable = live_vars & def_reach_map[inc_blk]
+                # But not defined in the predecessor
+                dct[inc_blk] |= reachable - var_def_map[inc_blk]
+
     live_map = {}
     for offset in blocks.keys():
-        live_map[offset] = var_use_map[offset]
+        live_map[offset] = set(var_use_map[offset])
 
-    def fix_point_progress():
-        return tuple(len(v) for v in live_map.values())
-
-    old_point = None
-    new_point = fix_point_progress()
-    while old_point != new_point:
-        for offset in live_map.keys():
-            for inc_blk, _data in cfg.predecessors(offset):
-                # substract all variables that are defined in
-                # the incoming block
-                live_map[inc_blk] |= live_map[offset] - var_def_map[inc_blk]
-        old_point = new_point
-        new_point = fix_point_progress()
-
+    def_reach_map = defaultdict(set)
+    fix_point(def_reach, def_reach_map)
+    fix_point(liveness, live_map)
     return live_map
 
 
@@ -97,14 +127,14 @@ def compute_dead_maps(cfg, blocks, live_map, var_def_map):
     escaping_dead_map = defaultdict(set)
     # all vars that should be deleted within this block
     internal_dead_map = defaultdict(set)
-    # all vars that should be delted after the function exit
+    # all vars that should be deleted after the function exit
     exit_dead_map = defaultdict(set)
 
     for offset, ir_block in blocks.items():
         # live vars WITHIN the block will include all the locally
         # defined variables
         cur_live_set = live_map[offset] | var_def_map[offset]
-        # vars alive alive in the outgoing blocks
+        # vars alive in the outgoing blocks
         outgoing_live_map = dict((out_blk, live_map[out_blk])
                                  for out_blk, _data in cfg.successors(offset))
         # vars to keep alive for the terminator
@@ -115,7 +145,7 @@ def compute_dead_maps(cfg, blocks, live_map, var_def_map):
                                   set())
         # include variables used in terminator
         combined_liveset |= terminator_liveset
-        # vars that are dead within the block beacuse they are not
+        # vars that are dead within the block because they are not
         # propagated to any outgoing blocks
         internal_set = cur_live_set - combined_liveset
         internal_dead_map[offset] = internal_set
@@ -231,3 +261,176 @@ def find_top_level_loops(cfg):
     for loop in cfg.loops().values():
         if loop.header not in blocks_in_loop:
             yield loop
+
+
+# Functions to manipulate IR
+def dead_branch_prune(func_ir, called_args):
+    """
+    Removes dead branches based on constant inference from function args.
+    This directly mutates the IR.
+
+    func_ir is the IR
+    called_args are the actual arguments with which the function is called
+    """
+    from .ir_utils import get_definition, guard, find_const, GuardException
+
+    DEBUG = 0
+
+    def find_branches(func_ir):
+        # find *all* branches
+        branches = []
+        for blk in func_ir.blocks.values():
+            branch_or_jump = blk.body[-1]
+            if isinstance(branch_or_jump, ir.Branch):
+                branch = branch_or_jump
+                condition = guard(get_definition, func_ir, branch.cond.name)
+                if condition is not None:
+                    branches.append((branch, condition, blk))
+        return branches
+
+    def do_prune(take_truebr, blk):
+        keep = branch.truebr if take_truebr else branch.falsebr
+        # replace the branch with a direct jump
+        jmp = ir.Jump(keep, loc=branch.loc)
+        blk.body[-1] = jmp
+        return 1 if keep == branch.truebr else 0
+
+    def prune_by_type(branch, condition, blk, *conds):
+        # this prunes a given branch and fixes up the IR
+        # at least one needs to be a NoneType
+        lhs_cond, rhs_cond = conds
+        lhs_none = isinstance(lhs_cond, types.NoneType)
+        rhs_none = isinstance(rhs_cond, types.NoneType)
+        if lhs_none or rhs_none:
+            try:
+                take_truebr = condition.fn(lhs_cond, rhs_cond)
+            except Exception:
+                return False, None
+            if DEBUG > 0:
+                kill = branch.falsebr if take_truebr else branch.truebr
+                print("Pruning %s" % kill, branch, lhs_cond, rhs_cond,
+                      condition.fn)
+            taken = do_prune(take_truebr, blk)
+            return True, taken
+        return False, None
+
+    def prune_by_value(branch, condition, blk, *conds):
+        lhs_cond, rhs_cond = conds
+        try:
+            take_truebr = condition.fn(lhs_cond, rhs_cond)
+        except Exception:
+            return False, None
+        if DEBUG > 0:
+            kill = branch.falsebr if take_truebr else branch.truebr
+            print("Pruning %s" % kill, branch, lhs_cond, rhs_cond, condition.fn)
+        taken = do_prune(take_truebr, blk)
+        return True, taken
+
+    class Unknown(object):
+        pass
+
+    def resolve_input_arg_const(input_arg_idx):
+        """
+        Resolves an input arg to a constant (if possible)
+        """
+        input_arg_ty = called_args[input_arg_idx]
+
+        # comparing to None?
+        if isinstance(input_arg_ty, types.NoneType):
+            return input_arg_ty
+
+        # is it a kwarg default
+        if isinstance(input_arg_ty, types.Omitted):
+            val = input_arg_ty.value
+            if isinstance(val, types.NoneType):
+                return val
+            elif val is None:
+                return types.NoneType('none')
+
+        # literal type, return the type itself so comparisons like `x == None`
+        # still work as e.g. x = types.int64 will never be None/NoneType so
+        # the branch can still be pruned
+        return getattr(input_arg_ty, 'literal_type', Unknown())
+
+    if DEBUG > 1:
+        print("before".center(80, '-'))
+        print(func_ir.dump())
+
+    # This looks for branches where:
+    # at least one arg of the condition is in input args and const
+    # at least one an arg of the condition is a const
+    # if the condition is met it will replace the branch with a jump
+    branch_info = find_branches(func_ir)
+    nullified_conditions = [] # stores conditions that have no impact post prune
+    for branch, condition, blk in branch_info:
+        const_conds = []
+        if isinstance(condition, ir.Expr) and condition.op == 'binop':
+            prune = prune_by_value
+            for arg in [condition.lhs, condition.rhs]:
+                resolved_const = Unknown()
+                arg_def = guard(get_definition, func_ir, arg)
+                if isinstance(arg_def, ir.Arg):
+                    # it's an e.g. literal argument to the function
+                    resolved_const = resolve_input_arg_const(arg_def.index)
+                    prune = prune_by_type
+                else:
+                    # it's some const argument to the function, cannot use guard
+                    # here as the const itself may be None
+                    try:
+                        resolved_const = find_const(func_ir, arg)
+                        if resolved_const is None:
+                            resolved_const = types.NoneType('none')
+                    except GuardException:
+                        pass
+
+                if not isinstance(resolved_const, Unknown):
+                    const_conds.append(resolved_const)
+
+            # lhs/rhs are consts
+            if len(const_conds) == 2:
+                # prune the branch, switch the branch for an unconditional jump
+                prune_stat, taken = prune(branch, condition, blk, *const_conds)
+                if(prune_stat):
+                    # add the condition to the list of nullified conditions
+                    nullified_conditions.append((condition, taken))
+
+    # 'ERE BE DRAGONS...
+    # It is the evaluation of the condition expression that often trips up type
+    # inference, so ideally it would be removed as it is effectively rendered
+    # dead by the unconditional jump if a branch was pruned. However, there may
+    # be references to the condition that exist in multiple places (e.g. dels)
+    # and we cannot run DCE here as typing has not taken place to give enough
+    # information to run DCE safely. Upshot of all this is the condition gets
+    # rewritten below into a benign const that typing will be happy with and DCE
+    # can remove it and its reference post typing when it is safe to do so
+    # (if desired). It is required that the const is assigned a value that
+    # indicates the branch taken as its mutated value would be read in the case
+    # of object mode fall back in place of the condition itself. For
+    # completeness the func_ir._definitions and ._consts are also updated to
+    # make the IR state self consistent.
+
+    deadcond = [x[0] for x in nullified_conditions]
+    for _, cond, blk in branch_info:
+        if cond in deadcond:
+            for x in blk.body:
+                if isinstance(x, ir.Assign) and x.value is cond:
+                    # rewrite the condition as a true/false bit
+                    branch_bit = nullified_conditions[deadcond.index(cond)][1]
+                    x.value = ir.Const(branch_bit, loc=x.loc)
+                    # update the specific definition to the new const
+                    defns = func_ir._definitions[x.target.name]
+                    repl_idx = defns.index(cond)
+                    defns[repl_idx] = x.value
+
+    # Remove dead blocks, this is safe as it relies on the CFG only.
+    cfg = compute_cfg_from_blocks(func_ir.blocks)
+    for dead in cfg.dead_nodes():
+        del func_ir.blocks[dead]
+
+    # if conditions were nullified then consts were rewritten, update
+    if nullified_conditions:
+        func_ir._consts = consts.ConstantInference(func_ir)
+
+    if DEBUG > 1:
+        print("after".center(80, '-'))
+        print(func_ir.dump())

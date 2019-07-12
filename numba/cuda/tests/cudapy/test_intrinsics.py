@@ -4,6 +4,7 @@ import numpy as np
 import re
 from numba import cuda, int32, float32
 from numba.cuda.testing import unittest, SerialMixin, skip_on_cudasim
+from numba.utils import IS_PY3
 
 
 def simple_threadidx(ary):
@@ -64,6 +65,10 @@ def simple_popc(ary, c):
     ary[0] = cuda.popc(c)
 
 
+def simple_fma(ary, a, b, c):
+    ary[0] = cuda.fma(a, b, c)
+
+
 def simple_brev(ary, c):
     ary[0] = cuda.brev(c)
 
@@ -74,6 +79,10 @@ def simple_clz(ary, c):
 
 def simple_ffs(ary, c):
     ary[0] = cuda.ffs(c)
+
+
+def simple_round(ary, c):
+    ary[0] = round(c)
 
 
 def branching_with_ifs(a, b, c):
@@ -93,6 +102,15 @@ def branching_with_selps(a, b, c):
 
     inner = cuda.selp(b % 2 == 0, c[i], 13)
     a[i] = cuda.selp(a[i] > 4, inner, 3)
+
+
+def simple_laneid(ary):
+    i = cuda.grid(1)
+    ary[i] = cuda.laneid
+
+
+def simple_warpsize(ary):
+    ary[0] = cuda.warpsize
 
 
 class TestCudaIntrinsic(SerialMixin, unittest.TestCase):
@@ -255,6 +273,18 @@ class TestCudaIntrinsic(SerialMixin, unittest.TestCase):
         compiled(ary, 0xF00000000000)
         self.assertEquals(ary[0], 4)
 
+    def test_fma_f4(self):
+        compiled = cuda.jit("void(f4[:], f4, f4, f4)")(simple_fma)
+        ary = np.zeros(1, dtype=np.float32)
+        compiled(ary, 2., 3., 4.)
+        np.testing.assert_allclose(ary[0], 2 * 3 + 4)
+
+    def test_fma_f8(self):
+        compiled = cuda.jit("void(f8[:], f8, f8, f8)")(simple_fma)
+        ary = np.zeros(1, dtype=np.float64)
+        compiled(ary, 2., 3., 4.)
+        np.testing.assert_allclose(ary[0], 2 * 3 + 4)
+
     def test_brev_u4(self):
         compiled = cuda.jit("void(uint32[:], uint32)")(simple_brev)
         ary = np.zeros(1, dtype=np.uint32)
@@ -336,6 +366,39 @@ class TestCudaIntrinsic(SerialMixin, unittest.TestCase):
         ary = np.zeros(1, dtype=np.int32)
         compiled(ary, 0x000000000010000)
         self.assertEquals(ary[0], 16)
+
+    def test_simple_laneid(self):
+        compiled = cuda.jit("void(int32[:])")(simple_laneid)
+        count = 2
+        ary = np.zeros(count*32, dtype=np.int32)
+        exp = np.tile(np.arange(32, dtype=np.int32), count)
+        compiled[1, count*32](ary)
+        self.assertTrue(np.all(ary == exp))
+
+    def test_simple_warpsize(self):
+        compiled = cuda.jit("void(int32[:])")(simple_warpsize)
+        ary = np.zeros(1, dtype=np.int32)
+        compiled(ary)
+        self.assertEquals(ary[0], 32, "CUDA semantics")
+
+    @unittest.skipUnless(IS_PY3, "round() returns float on Py2")
+    def test_round_f4(self):
+        compiled = cuda.jit("void(int64[:], float32)")(simple_round)
+        ary = np.zeros(1, dtype=np.int32)
+
+        for i in [-3.0, -2.5, -2.25, -1.5, 1.5, 2.25, 2.5, 2.75]:
+            compiled(ary, i)
+            self.assertEquals(ary[0], round(i))
+
+    @unittest.skipUnless(IS_PY3, "round() returns float on Py2")
+    def test_round_f8(self):
+        compiled = cuda.jit("void(int64[:], float64)")(simple_round)
+        ary = np.zeros(1, dtype=np.int32)
+
+        for i in [-3.0, -2.5, -2.25, -1.5, 1.5, 2.25, 2.5, 2.75]:
+            compiled(ary, i)
+            self.assertEquals(ary[0], round(i))
+
 
 if __name__ == '__main__':
     unittest.main()

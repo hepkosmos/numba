@@ -6,6 +6,9 @@ from . import nrtdynmod
 from llvmlite import binding as ll
 
 from numba.utils import finalize as _finalize
+from numba.compiler_lock import global_compiler_lock
+from numba.typing.typeof import typeof_impl
+from numba import types
 from . import _nrt_python as _nrt
 
 _nrt_mstats = namedtuple("nrt_mstats", ["alloc", "free", "mi_alloc", "mi_free"])
@@ -15,37 +18,35 @@ class _Runtime(object):
     def __init__(self):
         self._init = False
 
+    @global_compiler_lock
     def initialize(self, ctx):
         """Initializes the NRT
 
         Must be called before any actual call to the NRT API.
         Safe to be called multiple times.
         """
-        from numba.compiler import lock_compiler
+        if self._init:
+            # Already initialized
+            return
 
-        with lock_compiler:
-            if self._init:
-                # Already initialized
-                return
+        # Register globals into the system
+        for py_name in _nrt.c_helpers:
+            c_name = "NRT_" + py_name
+            c_address = _nrt.c_helpers[py_name]
+            ll.add_symbol(c_name, c_address)
 
-            # Register globals into the system
-            for py_name in _nrt.c_helpers:
-                c_name = "NRT_" + py_name
-                c_address = _nrt.c_helpers[py_name]
-                ll.add_symbol(c_name, c_address)
+        # Compile atomic operations
+        self._library = nrtdynmod.compile_nrt_functions(ctx)
 
-            # Compile atomic operations
-            self._library = nrtdynmod.compile_nrt_functions(ctx)
+        self._ptr_inc = self._library.get_pointer_to_function("nrt_atomic_add")
+        self._ptr_dec = self._library.get_pointer_to_function("nrt_atomic_sub")
+        self._ptr_cas = self._library.get_pointer_to_function("nrt_atomic_cas")
 
-            self._ptr_inc = self._library.get_pointer_to_function("nrt_atomic_add")
-            self._ptr_dec = self._library.get_pointer_to_function("nrt_atomic_sub")
-            self._ptr_cas = self._library.get_pointer_to_function("nrt_atomic_cas")
+        # Install atomic ops to NRT
+        _nrt.memsys_set_atomic_inc_dec(self._ptr_inc, self._ptr_dec)
+        _nrt.memsys_set_atomic_cas(self._ptr_cas)
 
-            # Install atomic ops to NRT
-            _nrt.memsys_set_atomic_inc_dec(self._ptr_inc, self._ptr_dec)
-            _nrt.memsys_set_atomic_cas(self._ptr_cas)
-
-            self._init = True
+        self._init = True
 
     def _init_guard(self):
         if not self._init:
@@ -109,6 +110,12 @@ class _Runtime(object):
 
 # Alias to _nrt_python._MemInfo
 MemInfo = _nrt._MemInfo
+
+
+@typeof_impl.register(MemInfo)
+def typeof_meminfo(val, c):
+    return types.MemInfoPointer(types.voidptr)
+
 
 # Create runtime
 _nrt.memsys_use_cpython_allocator()

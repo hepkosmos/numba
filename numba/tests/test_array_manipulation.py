@@ -4,8 +4,10 @@ from functools import partial
 from itertools import permutations
 import numba.unittest_support as unittest
 
+import sys
 import numpy as np
 
+from numba.numpy_support import version as np_version
 from numba.compiler import compile_isolated, Flags
 from numba import jit, types, from_dtype, errors, typeof
 from numba.errors import TypingError
@@ -126,6 +128,18 @@ def bad_float_index(arr):
     # 2D index required for this function because 1D index
     # fails typing
     return arr[1, 2.0]
+
+
+def numpy_fill_diagonal(arr, val, wrap=False):
+    return np.fill_diagonal(arr, val, wrap)
+
+
+def numpy_shape(arr):
+    return np.shape(arr)
+
+
+def numpy_flatnonzero(a):
+    return np.flatnonzero(a)
 
 
 class TestArrayManipulation(MemoryLeakMixin, TestCase):
@@ -325,6 +339,10 @@ class TestArrayManipulation(MemoryLeakMixin, TestCase):
         check_err_axis_oob(arrs[3], (3, 1, 2, 5))
         check_err_axis_oob(arrs[3], (3, 1, 2, -5))
 
+        with self.assertRaises(TypingError) as e:
+            jit(nopython=True)(numpy_transpose_array)((np.array([0, 1]),))
+        self.assertIn("np.transpose does not accept tuples",
+                        str(e.exception))
 
     @tag('important')
     def test_expand_dims(self):
@@ -584,6 +602,220 @@ class TestArrayManipulation(MemoryLeakMixin, TestCase):
                              (types.Array(types.float64, 2, 'C'),))
         self.assertIn('unsupported array index type float64',
                       str(raises.exception))
+
+    def test_fill_diagonal_basic(self):
+        pyfunc = numpy_fill_diagonal
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def _shape_variations(n):
+            # square
+            yield (n, n)
+            # tall and thin
+            yield (2 * n, n)
+            # short and fat
+            yield (n, 2 * n)
+            # a bit taller than wide; odd numbers of rows and cols
+            yield ((2 * n + 1), (2 * n - 1))
+            # 4d, all dimensions same
+            yield (n, n, n, n)
+            # weird edge case
+            yield (1, 1, 1)
+
+        def _val_variations():
+            yield 1
+            yield 3.142
+            yield np.nan
+            yield -np.inf
+            yield True
+            yield np.arange(4)
+            yield (4,)
+            yield [8, 9]
+            yield np.arange(54).reshape(9, 3, 2, 1)  # contiguous C
+            yield np.asfortranarray(np.arange(9).reshape(3, 3))  # contiguous F
+            yield np.arange(9).reshape(3, 3)[::-1]  # non-contiguous
+
+        # contiguous arrays
+        def _multi_dimensional_array_variations(n):
+            for shape in _shape_variations(n):
+                yield np.zeros(shape, dtype=np.float64)
+                yield np.asfortranarray(np.ones(shape, dtype=np.float64))
+
+        # non-contiguous arrays
+        def _multi_dimensional_array_variations_strided(n):
+            for shape in _shape_variations(n):
+                tmp = np.zeros(tuple([x * 2 for x in shape]), dtype=np.float64)
+                slicer = tuple(slice(0, x * 2, 2) for x in shape)
+                yield tmp[slicer]
+
+        def _check_fill_diagonal(arr, val):
+            for wrap in None, True, False:
+                a = arr.copy()
+                b = arr.copy()
+
+                if wrap is None:
+                    params = {}
+                else:
+                    params = {'wrap': wrap}
+
+                pyfunc(a, val, **params)
+                cfunc(b, val, **params)
+                self.assertPreciseEqual(a, b)
+
+        for arr in _multi_dimensional_array_variations(3):
+            for val in _val_variations():
+                _check_fill_diagonal(arr, val)
+
+        for arr in _multi_dimensional_array_variations_strided(3):
+            for val in _val_variations():
+                _check_fill_diagonal(arr, val)
+
+        # non-numeric input arrays
+        arr = np.array([True] * 9).reshape(3, 3)
+        _check_fill_diagonal(arr, False)
+        _check_fill_diagonal(arr, [False, True, False])
+        _check_fill_diagonal(arr, np.array([True, False, True]))
+
+    def test_fill_diagonal_exception_cases(self):
+        pyfunc = numpy_fill_diagonal
+        cfunc = jit(nopython=True)(pyfunc)
+        val = 1
+
+        # Exceptions leak references
+        self.disable_leak_check()
+
+        # first argument unsupported number of dimensions
+        for a in np.array([]), np.ones(5):
+            with self.assertRaises(TypingError) as raises:
+                cfunc(a, val)
+            assert "The first argument must be at least 2-D" in str(raises.exception)
+
+        # multi-dimensional input where dimensions are not all equal
+        with self.assertRaises(ValueError) as raises:
+            a = np.zeros((3, 3, 4))
+            cfunc(a, val)
+            self.assertEqual("All dimensions of input must be of equal length", str(raises.exception))
+
+        # cases where val has incompatible type / value
+        def _assert_raises(arr, val):
+            with self.assertRaises(ValueError) as raises:
+                cfunc(arr, val)
+            self.assertEqual("Unable to safely conform val to a.dtype", str(raises.exception))
+
+        arr = np.zeros((3, 3), dtype=np.int32)
+        val = np.nan
+        _assert_raises(arr, val)
+
+        val = [3.3, np.inf]
+        _assert_raises(arr, val)
+
+        val = np.array([1, 2, 1e10], dtype=np.int64)
+        _assert_raises(arr, val)
+
+        arr = np.zeros((3, 3), dtype=np.float32)
+        val = [1.4, 2.6, -1e100]
+        _assert_raises(arr, val)
+
+        val = 1.1e100
+        _assert_raises(arr, val)
+
+        val = np.array([-1e100])
+        _assert_raises(arr, val)
+
+
+    def test_shape(self):
+        pyfunc = numpy_shape
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def check(x):
+            expected = pyfunc(x)
+            got = cfunc(x)
+            self.assertPreciseEqual(got, expected)
+
+        # check arrays
+        for t in [(), (1,), (2, 3,), (4, 5, 6)]:
+            arr = np.empty(t)
+            check(arr)
+
+        # check some types that go via asarray
+        for t in [1, False, [1,], [[1, 2,],[3, 4]], (1,), (1, 2, 3)]:
+            check(arr)
+
+        with self.assertRaises(TypingError) as raises:
+            cfunc('a')
+
+        self.assertIn("The argument to np.shape must be array-like",
+                      str(raises.exception))
+
+    def test_flatnonzero_basic(self):
+        # these tests should pass in all numpy versions
+        pyfunc = numpy_flatnonzero
+        cfunc = jit(nopython=True)(pyfunc)
+
+        def a_variations():
+            yield np.arange(-5, 5)
+            yield np.full(5, fill_value=0)
+            yield np.array([])
+            a = self.random.randn(100)
+            a[np.abs(a) > 0.2] = 0.0
+            yield a
+            yield a.reshape(5, 5, 4)
+            yield a.reshape(50, 2, order='F')
+            yield a.reshape(25, 4)[1::2]
+            yield a * 1j
+
+        for a in a_variations():
+            expected = pyfunc(a)
+            got = cfunc(a)
+            self.assertPreciseEqual(expected, got)
+
+    @staticmethod
+    def array_like_variations():
+        yield ((1.1, 2.2), (3.3, 4.4), (5.5, 6.6))
+        yield (0.0, 1.0, 0.0, -6.0)
+        yield ([0, 1], [2, 3])
+        yield ()
+        yield np.nan
+        yield 0
+        yield 1
+        yield False
+        yield (True, False, True)
+        yield 2 + 1j
+        # the following are not array-like, but numpy 1.15+ does not raise
+        yield None
+        if not sys.version_info < (3,):
+            yield 'a_string'
+
+    @unittest.skipUnless(np_version >= (1, 15),
+                         "flatnonzero array-like handling per 1.15+")
+    def test_flatnonzero_array_like_115_and_on(self):
+        # these tests should pass where numpy version is >= 1.15
+        pyfunc = numpy_flatnonzero
+        cfunc = jit(nopython=True)(pyfunc)
+
+        for a in self.array_like_variations():
+            expected = pyfunc(a)
+            got = cfunc(a)
+            self.assertPreciseEqual(expected, got)
+
+    @unittest.skipUnless(np_version < (1, 15),
+                         "flatnonzero array-like handling pre 1.15")
+    def test_flatnonzero_array_like_pre_115(self):
+        # these tests should pass where numpy version is < 1.15
+        pyfunc = numpy_flatnonzero
+        cfunc = jit(nopython=True)(pyfunc)
+
+        for a in self.array_like_variations():
+            with self.assertTypingError() as e:
+                cfunc(a)
+
+            self.assertIn("Argument 'a' must be an array", str(e.exception))
+
+            # numpy raises an Attribute error with:
+            # 'xxx' object has no attribute 'ravel'
+            with self.assertRaises(AttributeError) as e:
+                pyfunc(a)
+
+            self.assertIn("object has no attribute 'ravel'", str(e.exception))
 
 
 if __name__ == '__main__':

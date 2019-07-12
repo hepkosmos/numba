@@ -6,6 +6,7 @@ from itertools import product, cycle
 import sys
 import warnings
 from numbers import Number, Integral
+import platform
 
 import numpy as np
 
@@ -14,6 +15,8 @@ from numba import jit, errors
 from numba.numpy_support import version as numpy_version
 from .support import TestCase, tag
 from .matmul_usecase import matmul_usecase, needs_matmul, needs_blas
+
+_is_armv7l = platform.machine() == 'armv7l'
 
 try:
     import scipy.linalg.cython_lapack
@@ -66,10 +69,10 @@ class TestProduct(TestCase):
         Check performance warning(s) for non-contiguity.
         """
         with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter('always', errors.PerformanceWarning)
+            warnings.simplefilter('always', errors.NumbaPerformanceWarning)
             yield
         self.assertGreaterEqual(len(w), 1)
-        self.assertIs(w[0].category, errors.PerformanceWarning)
+        self.assertIs(w[0].category, errors.NumbaPerformanceWarning)
         self.assertIn("faster on contiguous arrays", str(w[0].message))
         self.assertEqual(w[0].filename, pyfunc.__code__.co_filename)
         # This works because our functions are one-liners
@@ -82,10 +85,33 @@ class TestProduct(TestCase):
             self.assertPreciseEqual(got, expected, ignore_sign_on_zero=True)
             del got, expected
 
+
+    def _aligned_copy(self, arr):
+        # This exists for armv7l because NumPy wants aligned arrays for the
+        # `out` arg of functions, but np.empty/np.copy doesn't seem to always
+        # produce them, in particular for complex dtypes
+        size = (arr.size + 1) * arr.itemsize + 1
+        datasize = arr.size * arr.itemsize
+        tmp = np.empty(size, dtype=np.uint8)
+        for i in range(arr.itemsize + 1):
+            new = tmp[i : i + datasize].view(dtype=arr.dtype)
+            if new.flags.aligned:
+                break
+        else:
+            raise Exception("Could not obtain aligned array")
+        if arr.flags.c_contiguous:
+            new = np.reshape(new, arr.shape, order='C')
+        else:
+            new = np.reshape(new, arr.shape, order='F')
+        new[:] = arr[:]
+        assert new.flags.aligned
+        return new
+
     def check_func_out(self, pyfunc, cfunc, args, out):
+        copier = self._aligned_copy if _is_armv7l else np.copy
         with self.assertNoNRTLeak():
-            expected = np.copy(out)
-            got = np.copy(out)
+            expected = copier(out)
+            got = copier(out)
             self.assertIs(pyfunc(*args, out=expected), expected)
             self.assertIs(cfunc(*args, out=got), got)
             self.assertPreciseEqual(got, expected, ignore_sign_on_zero=True)
@@ -2026,15 +2052,27 @@ class TestLinalgCond(TestLinalgBase):
         for sz in [(0, 1), (1, 0), (0, 0)]:
             self.assert_raise_on_empty(cfunc, (np.empty(sz),))
 
+        # singular systems to trip divide-by-zero
+        # only for np > 1.14, before this norm was computed via inversion which
+        # will fail with numpy.linalg.linalg.LinAlgError: Singular matrix
+        if numpy_version > (1, 14):
+            x = np.array([[1, 0], [0, 0]], dtype=np.float64)
+            check(x)
+            check(x, p=2)
+            x = np.array([[0, 0], [0, 0]], dtype=np.float64)
+            check(x, p=-2)
+
         # try an ill-conditioned system with 2-norm, make sure np raises an
         # overflow warning as the result is `+inf` and that the result from
         # numba matches.
         with warnings.catch_warnings():
             a = np.array([[1.e308, 0], [0, 0.1]], dtype=np.float64)
-            warnings.simplefilter("error", RuntimeWarning)
-            self.assertRaisesRegexp(RuntimeWarning,
-                                    'overflow encountered in.*',
-                                    check, a)
+            if numpy_version < (1, 15):
+                # overflow warning is silenced in np >= 1.15
+                warnings.simplefilter("error", RuntimeWarning)
+                self.assertRaisesRegexp(RuntimeWarning,
+                                        'overflow encountered in.*',
+                                        check, a)
             warnings.simplefilter("ignore", RuntimeWarning)
             check(a)
 
@@ -2409,6 +2447,10 @@ class TestBasics(TestLinalgSystems):  # TestLinalgSystems for 1d test
             check(a, b)
 
         self._assert_wrong_dim("kron", cfunc)
+
+        args = (np.empty(10)[::2], np.empty(10)[::2])
+        msg = "only supports 'C' or 'F' layout"
+        self.assert_error(cfunc, args, msg, err=errors.TypingError)
 
 
 if __name__ == '__main__':

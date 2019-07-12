@@ -73,9 +73,42 @@ else:
 
 try:
     from inspect import signature as pysignature
+    from inspect import Signature as pySignature
+    from inspect import Parameter as pyParameter
 except ImportError:
     try:
         from funcsigs import signature as pysignature
+        from funcsigs import Signature as pySignature
+        from funcsigs import Parameter as pyParameter
+        from funcsigs import BoundArguments
+
+        # monkey patch `apply_defaults` onto `BoundArguments` cf inspect in py3
+        # This patch is from https://github.com/aliles/funcsigs/pull/30/files
+        # with minor modifications, and thanks!
+        # See LICENSES.third-party.
+        def apply_defaults(self):
+            arguments = self.arguments
+
+            # Creating a new one and not modifying in-place for thread safety.
+            new_arguments = []
+
+            for name, param in self._signature.parameters.items():
+                try:
+                    new_arguments.append((name, arguments[name]))
+                except KeyError:
+                    if param.default is not param.empty:
+                        val = param.default
+                    elif param.kind is _VAR_POSITIONAL:
+                        val = ()
+                    elif param.kind is _VAR_KEYWORD:
+                        val = {}
+                    else:
+                        # BoundArguments was likely created by bind_partial
+                        continue
+                    new_arguments.append((name, val))
+
+            self.arguments = collections.OrderedDict(new_arguments)
+        BoundArguments.apply_defaults = apply_defaults
     except ImportError:
         raise ImportError("please install the 'funcsigs' package "
                           "('pip install funcsigs')")
@@ -125,44 +158,109 @@ except ImportError:
 # Mapping between operator module functions and the corresponding built-in
 # operators.
 
-operator_map = [
-    # Binary
-    ('add', 'iadd', '+'),
-    ('sub', 'isub', '-'),
-    ('mul', 'imul', '*'),
-    ('floordiv', 'ifloordiv', '//'),
-    ('truediv', 'itruediv', '/'),
-    ('mod', 'imod', '%'),
-    ('pow', 'ipow', '**'),
-    ('and_', 'iand', '&'),
-    ('or_', 'ior', '|'),
-    ('xor', 'ixor', '^'),
-    ('lshift', 'ilshift', '<<'),
-    ('rshift', 'irshift', '>>'),
-    ('eq', '', '=='),
-    ('ne', '', '!='),
-    ('lt', '', '<'),
-    ('le', '', '<='),
-    ('gt', '', '>'),
-    ('ge', '', '>='),
+BINOPS_TO_OPERATORS = {
+    '+': operator.add,
+    '-': operator.sub,
+    '*': operator.mul,
+    '//': operator.floordiv,
+    '/': operator.truediv,
+    '%': operator.mod,
+    '**': operator.pow,
+    '&': operator.and_,
+    '|': operator.or_,
+    '^': operator.xor,
+    '<<': operator.lshift,
+    '>>': operator.rshift,
+    '==': operator.eq,
+    '!=': operator.ne,
+    '<': operator.lt,
+    '<=': operator.le,
+    '>': operator.gt,
+    '>=': operator.ge,
+    'is': operator.is_,
+    'is not': operator.is_not,
     # This one has its args reversed!
-    ('contains', '', 'in'),
+    'in': operator.contains
+}
+
+INPLACE_BINOPS_TO_OPERATORS = {
+    '+=': operator.iadd,
+    '-=': operator.isub,
+    '*=': operator.imul,
+    '//=': operator.ifloordiv,
+    '/=': operator.itruediv,
+    '%=': operator.imod,
+    '**=': operator.ipow,
+    '&=': operator.iand,
+    '|=': operator.ior,
+    '^=': operator.ixor,
+    '<<=': operator.ilshift,
+    '>>=': operator.irshift,
+}
+
+UNARY_BUITINS_TO_OPERATORS = {
+    '+': operator.pos,
+    '-': operator.neg,
+    '~': operator.invert,
+    'not': operator.not_,
+    'is_true': operator.truth
+}
+
+OPERATORS_TO_BUILTINS = {
+    operator.add: '+',
+    operator.iadd: '+=',
+    operator.sub: '-',
+    operator.isub: '-=',
+    operator.mul: '*',
+    operator.imul: '*=',
+    operator.floordiv: '//',
+    operator.ifloordiv: '//=',
+    operator.truediv: '/',
+    operator.itruediv: '/=',
+    operator.mod: '%',
+    operator.imod: '%=',
+    operator.pow: '**',
+    operator.ipow: '**=',
+    operator.and_: '&',
+    operator.iand: '&=',
+    operator.or_: '|',
+    operator.ior: '|=',
+    operator.xor: '^',
+    operator.ixor: '^=',
+    operator.lshift: '<<',
+    operator.ilshift: '<<=',
+    operator.rshift: '>>',
+    operator.irshift: '>>=',
+    operator.eq: '==',
+    operator.ne: '!=',
+    operator.lt: '<',
+    operator.le: '<=',
+    operator.gt: '>',
+    operator.ge: '>=',
+    operator.is_: 'is',
+    operator.is_not: 'is not',
+    # This one has its args reversed!
+    operator.contains: 'in',
     # Unary
-    ('pos', '', '+'),
-    ('neg', '', '-'),
-    ('invert', '', '~'),
-    ('not_', '', 'not'),
-    ]
+    operator.pos: '+',
+    operator.neg: '-',
+    operator.invert: '~',
+    operator.not_: 'not',
+    operator.truth: 'is_true',
+}
+
+HAS_MATMUL_OPERATOR = sys.version_info >= (3, 5)
 
 if not IS_PY3:
-    operator_map.append(('div', 'idiv', '/?'))
-if sys.version_info >= (3, 5):
-    operator_map.append(('matmul', 'imatmul', '@'))
+    BINOPS_TO_OPERATORS['/?'] = operator.div
+    INPLACE_BINOPS_TO_OPERATORS['/?='] = operator.idiv
+    OPERATORS_TO_BUILTINS[operator.div] = '/?'
+    OPERATORS_TO_BUILTINS[operator.idiv] = '/?'
+if HAS_MATMUL_OPERATOR:
+    BINOPS_TO_OPERATORS['@'] = operator.matmul
+    INPLACE_BINOPS_TO_OPERATORS['@='] = operator.imatmul
 
-# Map of known in-place operators to their corresponding copying operators
-inplace_map = dict((op + '=', op)
-                   for (_bin, _inp, op) in operator_map
-                   if _inp)
+
 
 
 _shutting_down = False
@@ -233,7 +331,7 @@ class ConfigOptions(object):
         return hash(tuple(sorted(self._values.items())))
 
 
-class SortedMap(collections.Mapping):
+class SortedMap(Mapping):
     """Immutable
     """
 
